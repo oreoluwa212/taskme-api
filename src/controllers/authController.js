@@ -233,22 +233,25 @@ const resetPassword = async (req, res) => {
         const { email, code, newPassword } = req.body;
 
         const user = await User.findOne({ email });
+
         if (!user) {
             return res.status(404).json({
                 success: false,
-                message: 'User not found'
+                message: 'User not found',
             });
         }
 
-        // Check if code matches and is not expired
-        if (user.resetCode !== code || user.resetCodeExpires < Date.now()) {
+        const codeMatches = String(user.resetCode) === String(code);
+        const codeNotExpired = user.resetCodeExpires && user.resetCodeExpires > Date.now();
+
+        if (!codeMatches || !codeNotExpired) {
             return res.status(400).json({
                 success: false,
-                message: 'Invalid or expired reset code'
+                message: 'Invalid or expired reset code',
             });
         }
 
-        // Update password
+        // Update password and clear reset data
         user.password = newPassword;
         user.resetCode = undefined;
         user.resetCodeExpires = undefined;
@@ -256,12 +259,13 @@ const resetPassword = async (req, res) => {
 
         res.json({
             success: true,
-            message: 'Password reset successfully'
+            message: 'Password reset successfully',
         });
     } catch (error) {
-        res.status(400).json({
+        console.error(error);
+        res.status(500).json({
             success: false,
-            message: error.message
+            message: 'Something went wrong. Please try again.',
         });
     }
 };
