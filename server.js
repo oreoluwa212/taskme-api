@@ -25,21 +25,22 @@ app.get('/', (req, res) => {
 app.use('/api/auth', require('./src/routes/authRoutes'));
 app.use('/api/users', require('./src/routes/userRoutes'));
 app.use('/api/projects', require('./src/routes/projectRoutes'));
+app.use('/api/subtasks', require('./src/routes/subtaskRoutes'));
 
 // Error handling middleware
 app.use((err, req, res, next) => {
     console.error(err.stack);
-    res.status(500).json({ 
+    res.status(500).json({
         success: false,
-        message: 'Something went wrong!' 
+        message: 'Something went wrong!'
     });
 });
 
 // 404 handler
 app.use('*', (req, res) => {
-    res.status(404).json({ 
+    res.status(404).json({
         success: false,
-        message: 'Route not found' 
+        message: 'Route not found'
     });
 });
 

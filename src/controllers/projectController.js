@@ -1,5 +1,7 @@
 // src/controllers/projectController.js
 const Project = require('../models/Project');
+const Subtask = require('../models/Subtask');
+const aiService = require('../services/aiService');
 const mongoose = require('mongoose');
 
 // Helper function to determine status based on progress
@@ -10,10 +12,59 @@ const getStatusFromProgress = (progress) => {
     return 'Pending'; // fallback
 };
 
-// Create a new project
+// Helper function to resolve dependencies after all subtasks are created
+const resolveDependencies = async (subtasks, aiSubtasksData) => {
+    // Create a mapping of task titles to their ObjectIds
+    const titleToIdMap = {};
+    subtasks.forEach((subtask, index) => {
+        const originalTitle = aiSubtasksData[index].title;
+        titleToIdMap[originalTitle] = subtask._id;
+    });
+
+    // Update dependencies for each subtask
+    const updatePromises = subtasks.map(async (subtask, index) => {
+        const originalDependencies = aiSubtasksData[index].dependencies;
+
+        if (originalDependencies && Array.isArray(originalDependencies) && originalDependencies.length > 0) {
+            // Convert dependency titles to ObjectIds
+            const resolvedDependencies = originalDependencies
+                .map(depTitle => {
+                    // Handle both string and array formats from AI
+                    const cleanTitle = Array.isArray(depTitle) ? depTitle[0] : depTitle;
+                    return titleToIdMap[cleanTitle];
+                })
+                .filter(id => id !== undefined); // Remove any unresolved dependencies
+
+            if (resolvedDependencies.length > 0) {
+                return await Subtask.findByIdAndUpdate(
+                    subtask._id,
+                    { dependencies: resolvedDependencies },
+                    { new: true }
+                );
+            }
+        }
+
+        return subtask;
+    });
+
+    return await Promise.all(updatePromises);
+};
+
+// Create a new project with optional AI generation
 const createProject = async (req, res) => {
     try {
-        const { name, description, timeline, startDate, dueDate, dueTime, priority } = req.body;
+        const {
+            name,
+            description,
+            timeline,
+            startDate,
+            dueDate,
+            dueTime,
+            priority,
+            category,
+            tags,
+            generateAISubtasks = false  // New option
+        } = req.body;
 
         // Validate required fields
         if (!name || !description || !timeline || !startDate || !dueDate || !dueTime || !priority) {
@@ -51,15 +102,68 @@ const createProject = async (req, res) => {
             dueDate: due,
             dueTime,
             priority,
+            category,
+            tags,
             userId: req.user.id
         });
 
         await project.save();
 
+        let aiResponse = null;
+        let subtasks = [];
+
+        // Generate AI subtasks if requested
+        if (generateAISubtasks) {
+            try {
+                aiResponse = await aiService.generateProjectTasks({
+                    name: project.name,
+                    description: project.description,
+                    timeline: project.timeline,
+                    startDate: project.startDate,
+                    dueDate: project.dueDate,
+                    priority: project.priority
+                });
+
+                // First, create subtasks without dependencies
+                const subtaskPromises = aiResponse.subtasks.map(subtaskData => {
+                    const { dependencies, ...subtaskWithoutDeps } = subtaskData;
+                    return new Subtask({
+                        ...subtaskWithoutDeps,
+                        projectId: project._id,
+                        userId: req.user.id,
+                        aiGenerated: true,
+                        dependencies: [] // Initialize with empty dependencies
+                    }).save();
+                });
+
+                const createdSubtasks = await Promise.all(subtaskPromises);
+
+                // Now resolve and update dependencies
+                subtasks = await resolveDependencies(createdSubtasks, aiResponse.subtasks);
+
+                // Update project progress based on initial subtasks
+                const initialProgress = await Subtask.getProjectProgress(project._id);
+                project.progress = initialProgress;
+                await project.save();
+
+            } catch (aiError) {
+                console.error('AI generation error:', aiError);
+                // Continue without AI subtasks if there's an error
+            }
+        }
+
         res.status(201).json({
             success: true,
             message: 'Project created successfully',
-            data: project
+            data: {
+                project,
+                subtasks,
+                aiResponse: aiResponse ? {
+                    totalEstimatedHours: aiResponse.totalEstimatedHours,
+                    criticalPath: aiResponse.criticalPath,
+                    suggestions: aiResponse.suggestions
+                } : null
+            }
         });
     } catch (error) {
         console.error('Create project error:', error);
@@ -86,11 +190,13 @@ const getProjects = async (req, res) => {
         const {
             status,
             priority,
+            category,
             search,
             sortBy = 'createdAt',
             sortOrder = 'desc',
             page = 1,
-            limit = 10
+            limit = 10,
+            includeSubtasks = false
         } = req.query;
 
         let query = { userId: req.user.id };
@@ -105,12 +211,19 @@ const getProjects = async (req, res) => {
             query.priority = priority;
         }
 
+        // Filter by category
+        if (category) {
+            query.category = new RegExp(category, 'i');
+        }
+
         // Add search functionality
         if (search && search.trim()) {
             const searchRegex = new RegExp(search.trim(), 'i');
             query.$or = [
                 { name: searchRegex },
-                { description: searchRegex }
+                { description: searchRegex },
+                { category: searchRegex },
+                { tags: { $in: [searchRegex] } }
             ];
         }
 
@@ -121,14 +234,61 @@ const getProjects = async (req, res) => {
         // Pagination
         const skip = (parseInt(page) - 1) * parseInt(limit);
 
-        const projects = await Project.find(query)
+        let projectQuery = Project.find(query)
             .sort(sortOptions)
             .skip(skip)
-            .limit(parseInt(limit))
-            .lean();
+            .limit(parseInt(limit));
+
+        // Populate subtasks if requested
+        if (includeSubtasks === 'true') {
+            projectQuery = projectQuery.populate({
+                path: 'subtasks',
+                select: 'title status priority estimatedHours actualHours order'
+            });
+        }
+
+        const projects = await projectQuery.lean();
 
         // Get total count for pagination
         const total = await Project.countDocuments(query);
+
+        // Add subtask counts and progress for each project
+        const projectsWithStats = await Promise.all(
+            projects.map(async (project) => {
+                const subtaskStats = await Subtask.aggregate([
+                    { $match: { projectId: project._id } },
+                    {
+                        $group: {
+                            _id: '$status',
+                            count: { $sum: 1 },
+                            totalHours: { $sum: '$estimatedHours' }
+                        }
+                    }
+                ]);
+
+                const stats = {
+                    totalSubtasks: 0,
+                    completedSubtasks: 0,
+                    pendingSubtasks: 0,
+                    inProgressSubtasks: 0,
+                    totalEstimatedHours: 0
+                };
+
+                subtaskStats.forEach(stat => {
+                    stats.totalSubtasks += stat.count;
+                    stats.totalEstimatedHours += stat.totalHours || 0;
+
+                    if (stat._id === 'Completed') stats.completedSubtasks = stat.count;
+                    else if (stat._id === 'Pending') stats.pendingSubtasks = stat.count;
+                    else if (stat._id === 'In Progress') stats.inProgressSubtasks = stat.count;
+                });
+
+                return {
+                    ...project,
+                    subtaskStats: stats
+                };
+            })
+        );
 
         res.status(200).json({
             success: true,
@@ -136,13 +296,347 @@ const getProjects = async (req, res) => {
             total,
             page: parseInt(page),
             pages: Math.ceil(total / parseInt(limit)),
-            data: projects
+            data: projectsWithStats
         });
     } catch (error) {
         console.error('Get projects error:', error);
         res.status(500).json({
             success: false,
             message: 'Server error while fetching projects'
+        });
+    }
+};
+
+// Get a single project by ID with detailed information
+const getProject = async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { includeSubtasks = false } = req.query;
+
+        if (!mongoose.Types.ObjectId.isValid(id)) {
+            return res.status(400).json({
+                success: false,
+                message: 'Invalid project ID'
+            });
+        }
+
+        let projectQuery = Project.findOne({
+            _id: id,
+            userId: req.user.id
+        });
+
+        const project = await projectQuery.lean();
+
+        if (!project) {
+            return res.status(404).json({
+                success: false,
+                message: 'Project not found'
+            });
+        }
+
+        // Get subtasks if requested
+        let subtasks = [];
+        if (includeSubtasks === 'true') {
+            subtasks = await Subtask.find({ projectId: id })
+                .sort({ order: 1 })
+                .populate('dependencies', 'title status');
+        }
+
+        // Get project statistics
+        const stats = await Subtask.aggregate([
+            { $match: { projectId: new mongoose.Types.ObjectId(id) } },
+            {
+                $group: {
+                    _id: '$status',
+                    count: { $sum: 1 },
+                    totalEstimatedHours: { $sum: '$estimatedHours' },
+                    totalActualHours: { $sum: '$actualHours' }
+                }
+            }
+        ]);
+
+        const projectStats = {
+            totalSubtasks: 0,
+            completedSubtasks: 0,
+            pendingSubtasks: 0,
+            inProgressSubtasks: 0,
+            blockedSubtasks: 0,
+            totalEstimatedHours: 0,
+            totalActualHours: 0,
+            completionPercentage: 0
+        };
+
+        stats.forEach(stat => {
+            projectStats.totalSubtasks += stat.count;
+            projectStats.totalEstimatedHours += stat.totalEstimatedHours || 0;
+            projectStats.totalActualHours += stat.totalActualHours || 0;
+
+            switch (stat._id) {
+                case 'Completed': projectStats.completedSubtasks = stat.count; break;
+                case 'Pending': projectStats.pendingSubtasks = stat.count; break;
+                case 'In Progress': projectStats.inProgressSubtasks = stat.count; break;
+                case 'Blocked': projectStats.blockedSubtasks = stat.count; break;
+            }
+        });
+
+        if (projectStats.totalSubtasks > 0) {
+            projectStats.completionPercentage = Math.round(
+                (projectStats.completedSubtasks / projectStats.totalSubtasks) * 100
+            );
+        }
+
+        res.status(200).json({
+            success: true,
+            data: {
+                project,
+                subtasks,
+                stats: projectStats
+            }
+        });
+    } catch (error) {
+        console.error('Get project error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Server error while fetching project'
+        });
+    }
+};
+
+// Update a project with automatic progress recalculation
+const updateProject = async (req, res) => {
+    try {
+        const { id } = req.params;
+        const updateData = req.body;
+
+        if (!mongoose.Types.ObjectId.isValid(id)) {
+            return res.status(400).json({
+                success: false,
+                message: 'Invalid project ID'
+            });
+        }
+
+        // If dates are being updated, validate them
+        if (updateData.startDate && updateData.dueDate) {
+            const start = new Date(updateData.startDate);
+            const due = new Date(updateData.dueDate);
+
+            if (start >= due) {
+                return res.status(400).json({
+                    success: false,
+                    message: 'Due date must be after start date'
+                });
+            }
+        }
+
+        // Don't allow manual progress updates if subtasks exist
+        if (updateData.progress !== undefined) {
+            const subtaskCount = await Subtask.countDocuments({ projectId: id });
+            if (subtaskCount > 0) {
+                delete updateData.progress; // Remove manual progress update
+                console.log('Manual progress update ignored - calculated from subtasks');
+            }
+        }
+
+        const project = await Project.findOneAndUpdate(
+            { _id: id, userId: req.user.id },
+            updateData,
+            { new: true, runValidators: true }
+        );
+
+        if (!project) {
+            return res.status(404).json({
+                success: false,
+                message: 'Project not found'
+            });
+        }
+
+        // Recalculate progress from subtasks
+        const calculatedProgress = await Subtask.getProjectProgress(id);
+        if (calculatedProgress !== project.progress) {
+            project.progress = calculatedProgress;
+            project.status = getStatusFromProgress(calculatedProgress);
+            await project.save();
+        }
+
+        res.status(200).json({
+            success: true,
+            message: 'Project updated successfully',
+            data: project
+        });
+    } catch (error) {
+        console.error('Update project error:', error);
+
+        if (error.name === 'ValidationError') {
+            const errors = Object.values(error.errors).map(err => err.message);
+            return res.status(400).json({
+                success: false,
+                message: 'Validation error',
+                errors
+            });
+        }
+
+        res.status(500).json({
+            success: false,
+            message: 'Server error while updating project'
+        });
+    }
+};
+
+// Delete a project and all its subtasks
+const deleteProject = async (req, res) => {
+    try {
+        const { id } = req.params;
+
+        if (!mongoose.Types.ObjectId.isValid(id)) {
+            return res.status(400).json({
+                success: false,
+                message: 'Invalid project ID'
+            });
+        }
+
+        const project = await Project.findOneAndDelete({
+            _id: id,
+            userId: req.user.id
+        });
+
+        if (!project) {
+            return res.status(404).json({
+                success: false,
+                message: 'Project not found'
+            });
+        }
+
+        // Delete all associated subtasks
+        await Subtask.deleteMany({ projectId: id, userId: req.user.id });
+
+        res.status(200).json({
+            success: true,
+            message: 'Project and all associated subtasks deleted successfully'
+        });
+    } catch (error) {
+        console.error('Delete project error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Server error while deleting project'
+        });
+    }
+};
+
+// Get comprehensive project statistics
+const getProjectStats = async (req, res) => {
+    try {
+        const stats = await Project.getUserStats(req.user.id);
+
+        // Get additional insights
+        const additionalStats = await Project.aggregate([
+            { $match: { userId: new mongoose.Types.ObjectId(req.user.id) } },
+            {
+                $group: {
+                    _id: null,
+                    totalEstimatedHours: { $sum: '$estimatedHours' },
+                    averageTimeline: { $avg: '$timeline' },
+                    projectsThisMonth: {
+                        $sum: {
+                            $cond: [
+                                {
+                                    $gte: ['$createdAt', new Date(new Date().getFullYear(), new Date().getMonth(), 1)]
+                                },
+                                1,
+                                0
+                            ]
+                        }
+                    }
+                }
+            }
+        ]);
+
+        // Get category distribution
+        const categoryStats = await Project.aggregate([
+            { $match: { userId: new mongoose.Types.ObjectId(req.user.id) } },
+            {
+                $group: {
+                    _id: '$category',
+                    count: { $sum: 1 },
+                    averageProgress: { $avg: '$progress' }
+                }
+            },
+            { $sort: { count: -1 } }
+        ]);
+
+        res.status(200).json({
+            success: true,
+            data: {
+                ...stats,
+                additionalStats: additionalStats[0] || {},
+                categoryStats
+            }
+        });
+    } catch (error) {
+        console.error('Get project stats error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Server error while fetching project statistics'
+        });
+    }
+};
+
+// Update project progress manually (only if no subtasks exist)
+const updateProjectProgress = async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { progress } = req.body;
+
+        if (!mongoose.Types.ObjectId.isValid(id)) {
+            return res.status(400).json({
+                success: false,
+                message: 'Invalid project ID'
+            });
+        }
+
+        if (progress < 0 || progress > 100) {
+            return res.status(400).json({
+                success: false,
+                message: 'Progress must be between 0 and 100'
+            });
+        }
+
+        // Check if subtasks exist
+        const subtaskCount = await Subtask.countDocuments({ projectId: id });
+        if (subtaskCount > 0) {
+            return res.status(400).json({
+                success: false,
+                message: 'Cannot manually update progress when subtasks exist. Progress is calculated from subtasks.'
+            });
+        }
+
+        const newStatus = getStatusFromProgress(progress);
+
+        const project = await Project.findOneAndUpdate(
+            { _id: id, userId: req.user.id },
+            {
+                progress: progress,
+                status: newStatus
+            },
+            { new: true, runValidators: true }
+        );
+
+        if (!project) {
+            return res.status(404).json({
+                success: false,
+                message: 'Project not found'
+            });
+        }
+
+        res.status(200).json({
+            success: true,
+            message: 'Project progress updated successfully',
+            data: project
+        });
+    } catch (error) {
+        console.error('Update project progress error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Server error while updating project progress'
         });
     }
 };
@@ -154,6 +648,7 @@ const searchProjects = async (req, res) => {
             query: searchQuery,
             status,
             priority,
+            category,
             startDateFrom,
             startDateTo,
             dueDateFrom,
@@ -173,7 +668,9 @@ const searchProjects = async (req, res) => {
             const searchRegex = new RegExp(searchQuery.trim(), 'i');
             query.$or = [
                 { name: searchRegex },
-                { description: searchRegex }
+                { description: searchRegex },
+                { category: searchRegex },
+                { tags: { $in: [searchRegex] } }
             ];
         }
 
@@ -185,6 +682,11 @@ const searchProjects = async (req, res) => {
         // Filter by priority
         if (priority && ['Low', 'Medium', 'High'].includes(priority)) {
             query.priority = priority;
+        }
+
+        // Filter by category
+        if (category) {
+            query.category = new RegExp(category, 'i');
         }
 
         // Date range filters
@@ -233,6 +735,7 @@ const searchProjects = async (req, res) => {
                 query: searchQuery,
                 status,
                 priority,
+                category,
                 startDateFrom,
                 startDateTo,
                 dueDateFrom,
@@ -247,225 +750,6 @@ const searchProjects = async (req, res) => {
         res.status(500).json({
             success: false,
             message: 'Server error while searching projects'
-        });
-    }
-};
-
-// Get a single project by ID
-const getProject = async (req, res) => {
-    try {
-        const { id } = req.params;
-
-        if (!mongoose.Types.ObjectId.isValid(id)) {
-            return res.status(400).json({
-                success: false,
-                message: 'Invalid project ID'
-            });
-        }
-
-        const project = await Project.findOne({
-            _id: id,
-            userId: req.user.id
-        });
-
-        if (!project) {
-            return res.status(404).json({
-                success: false,
-                message: 'Project not found'
-            });
-        }
-
-        res.status(200).json({
-            success: true,
-            data: project
-        });
-    } catch (error) {
-        console.error('Get project error:', error);
-        res.status(500).json({
-            success: false,
-            message: 'Server error while fetching project'
-        });
-    }
-};
-
-// Update a project
-const updateProject = async (req, res) => {
-    try {
-        const { id } = req.params;
-        const updateData = req.body;
-
-        if (!mongoose.Types.ObjectId.isValid(id)) {
-            return res.status(400).json({
-                success: false,
-                message: 'Invalid project ID'
-            });
-        }
-
-        // If dates are being updated, validate them
-        if (updateData.startDate && updateData.dueDate) {
-            const start = new Date(updateData.startDate);
-            const due = new Date(updateData.dueDate);
-
-            if (start >= due) {
-                return res.status(400).json({
-                    success: false,
-                    message: 'Due date must be after start date'
-                });
-            }
-        }
-
-        // If progress is being updated, also update the status
-        if (updateData.progress !== undefined) {
-            updateData.status = getStatusFromProgress(updateData.progress);
-        }
-
-        const project = await Project.findOneAndUpdate(
-            { _id: id, userId: req.user.id },
-            updateData,
-            { new: true, runValidators: true }
-        );
-
-        if (!project) {
-            return res.status(404).json({
-                success: false,
-                message: 'Project not found'
-            });
-        }
-
-        res.status(200).json({
-            success: true,
-            message: 'Project updated successfully',
-            data: project
-        });
-    } catch (error) {
-        console.error('Update project error:', error);
-
-        if (error.name === 'ValidationError') {
-            const errors = Object.values(error.errors).map(err => err.message);
-            return res.status(400).json({
-                success: false,
-                message: 'Validation error',
-                errors
-            });
-        }
-
-        res.status(500).json({
-            success: false,
-            message: 'Server error while updating project'
-        });
-    }
-};
-
-// Delete a project
-const deleteProject = async (req, res) => {
-    try {
-        const { id } = req.params;
-
-        if (!mongoose.Types.ObjectId.isValid(id)) {
-            return res.status(400).json({
-                success: false,
-                message: 'Invalid project ID'
-            });
-        }
-
-        const project = await Project.findOneAndDelete({
-            _id: id,
-            userId: req.user.id
-        });
-
-        if (!project) {
-            return res.status(404).json({
-                success: false,
-                message: 'Project not found'
-            });
-        }
-
-        res.status(200).json({
-            success: true,
-            message: 'Project deleted successfully'
-        });
-    } catch (error) {
-        console.error('Delete project error:', error);
-        res.status(500).json({
-            success: false,
-            message: 'Server error while deleting project'
-        });
-    }
-};
-
-// Get project statistics
-const getProjectStats = async (req, res) => {
-    try {
-        const stats = await Project.getUserStats(req.user.id);
-
-        res.status(200).json({
-            success: true,
-            data: stats
-        });
-    } catch (error) {
-        console.error('Get project stats error:', error);
-        res.status(500).json({
-            success: false,
-            message: 'Server error while fetching project statistics'
-        });
-    }
-};
-
-// Update project progress (with automatic status update)
-const updateProjectProgress = async (req, res) => {
-    try {
-        const { id } = req.params;
-        const { progress } = req.body;
-
-        if (!mongoose.Types.ObjectId.isValid(id)) {
-            return res.status(400).json({
-                success: false,
-                message: 'Invalid project ID'
-            });
-        }
-
-        if (progress < 0 || progress > 100) {
-            return res.status(400).json({
-                success: false,
-                message: 'Progress must be between 0 and 100'
-            });
-        }
-
-        // Determine the new status based on progress
-        const newStatus = getStatusFromProgress(progress);
-
-        const project = await Project.findOneAndUpdate(
-            { _id: id, userId: req.user.id },
-            {
-                progress: progress,
-                status: newStatus  // Explicitly set the status
-            },
-            { new: true, runValidators: true }
-        );
-
-        if (!project) {
-            return res.status(404).json({
-                success: false,
-                message: 'Project not found'
-            });
-        }
-
-        // Get updated stats after progress change
-        const stats = await Project.getUserStats(req.user.id);
-
-        res.status(200).json({
-            success: true,
-            message: 'Project progress updated successfully',
-            data: {
-                project,
-                stats
-            }
-        });
-    } catch (error) {
-        console.error('Update project progress error:', error);
-        res.status(500).json({
-            success: false,
-            message: 'Server error while updating project progress'
         });
     }
 };
