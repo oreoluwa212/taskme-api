@@ -4,12 +4,95 @@ const Subtask = require('../models/Subtask');
 const aiService = require('../services/aiService');
 const mongoose = require('mongoose');
 
-// Helper function to determine status based on progress
-const getStatusFromProgress = (progress) => {
+// Helper function to determine status based on progress and subtask statuses
+const getStatusFromProgress = (progress, subtaskStats = null) => {
     if (progress === 0) return 'Pending';
-    if (progress > 0 && progress < 100) return 'In Progress';
     if (progress === 100) return 'Completed';
-    return 'Pending'; // fallback
+
+    // If we have subtask stats, use them for more accurate status determination
+    if (subtaskStats) {
+        const { totalSubtasks, inProgressSubtasks, completedSubtasks } = subtaskStats;
+
+        // If any subtask is in progress or some are completed, project is in progress
+        if (inProgressSubtasks > 0 || (completedSubtasks > 0 && completedSubtasks < totalSubtasks)) {
+            return 'In Progress';
+        }
+
+        // If all subtasks are completed
+        if (completedSubtasks === totalSubtasks && totalSubtasks > 0) {
+            return 'Completed';
+        }
+    }
+
+    // Fallback based on progress
+    if (progress > 0 && progress < 100) return 'In Progress';
+    return 'Pending';
+};
+
+// Enhanced function to update project progress and status
+const updateProjectProgressAndStatus = async (projectId) => {
+    try {
+        const project = await Project.findById(projectId);
+        if (!project) return null;
+
+        // Get subtask statistics
+        const subtaskStats = await Subtask.aggregate([
+            { $match: { projectId: new mongoose.Types.ObjectId(projectId) } },
+            {
+                $group: {
+                    _id: '$status',
+                    count: { $sum: 1 }
+                }
+            }
+        ]);
+
+        const stats = {
+            totalSubtasks: 0,
+            completedSubtasks: 0,
+            pendingSubtasks: 0,
+            inProgressSubtasks: 0,
+            blockedSubtasks: 0
+        };
+
+        subtaskStats.forEach(stat => {
+            stats.totalSubtasks += stat.count;
+
+            switch (stat._id) {
+                case 'Completed': stats.completedSubtasks = stat.count; break;
+                case 'Pending': stats.pendingSubtasks = stat.count; break;
+                case 'In Progress': stats.inProgressSubtasks = stat.count; break;
+                case 'Blocked': stats.blockedSubtasks = stat.count; break;
+            }
+        });
+
+        // Calculate progress
+        let progress = 0;
+        if (stats.totalSubtasks > 0) {
+            progress = Math.round((stats.completedSubtasks / stats.totalSubtasks) * 100);
+        }
+
+        // Determine new status
+        const newStatus = getStatusFromProgress(progress, stats);
+
+        // Update project
+        const updatedProject = await Project.findByIdAndUpdate(
+            projectId,
+            {
+                progress: progress,
+                status: newStatus
+            },
+            { new: true }
+        );
+
+        return {
+            project: updatedProject,
+            stats
+        };
+
+    } catch (error) {
+        console.error('Error updating project progress and status:', error);
+        return null;
+    }
 };
 
 // Helper function to resolve dependencies after all subtasks are created
@@ -141,10 +224,12 @@ const createProject = async (req, res) => {
                 // Now resolve and update dependencies
                 subtasks = await resolveDependencies(createdSubtasks, aiResponse.subtasks);
 
-                // Update project progress based on initial subtasks
-                const initialProgress = await Subtask.getProjectProgress(project._id);
-                project.progress = initialProgress;
-                await project.save();
+                // Update project progress and status based on initial subtasks
+                const projectUpdate = await updateProjectProgressAndStatus(project._id);
+                if (projectUpdate) {
+                    project.progress = projectUpdate.project.progress;
+                    project.status = projectUpdate.project.status;
+                }
 
             } catch (aiError) {
                 console.error('AI generation error:', aiError);
@@ -252,7 +337,7 @@ const getProjects = async (req, res) => {
         // Get total count for pagination
         const total = await Project.countDocuments(query);
 
-        // Add subtask counts and progress for each project
+        // Add subtask counts and progress for each project (and update status if needed)
         const projectsWithStats = await Promise.all(
             projects.map(async (project) => {
                 const subtaskStats = await Subtask.aggregate([
@@ -282,6 +367,26 @@ const getProjects = async (req, res) => {
                     else if (stat._id === 'Pending') stats.pendingSubtasks = stat.count;
                     else if (stat._id === 'In Progress') stats.inProgressSubtasks = stat.count;
                 });
+
+                // Calculate current progress
+                let currentProgress = 0;
+                if (stats.totalSubtasks > 0) {
+                    currentProgress = Math.round((stats.completedSubtasks / stats.totalSubtasks) * 100);
+                }
+
+                // Check if project status needs updating
+                const expectedStatus = getStatusFromProgress(currentProgress, stats);
+                if (project.status !== expectedStatus || project.progress !== currentProgress) {
+                    // Update project in background
+                    Project.findByIdAndUpdate(project._id, {
+                        progress: currentProgress,
+                        status: expectedStatus
+                    }).exec();
+
+                    // Update the returned data
+                    project.progress = currentProgress;
+                    project.status = expectedStatus;
+                }
 
                 return {
                     ...project,
@@ -320,12 +425,10 @@ const getProject = async (req, res) => {
             });
         }
 
-        let projectQuery = Project.findOne({
+        let project = await Project.findOne({
             _id: id,
             userId: req.user.id
-        });
-
-        const project = await projectQuery.lean();
+        }).lean();
 
         if (!project) {
             return res.status(404).json({
@@ -342,7 +445,7 @@ const getProject = async (req, res) => {
                 .populate('dependencies', 'title status');
         }
 
-        // Get project statistics
+        // Get project statistics and update project if needed
         const stats = await Subtask.aggregate([
             { $match: { projectId: new mongoose.Types.ObjectId(id) } },
             {
@@ -383,6 +486,18 @@ const getProject = async (req, res) => {
             projectStats.completionPercentage = Math.round(
                 (projectStats.completedSubtasks / projectStats.totalSubtasks) * 100
             );
+        }
+
+        // Check if project needs status/progress update
+        const expectedStatus = getStatusFromProgress(projectStats.completionPercentage, projectStats);
+        if (project.status !== expectedStatus || project.progress !== projectStats.completionPercentage) {
+            // Update project
+            const updatedProject = await Project.findByIdAndUpdate(id, {
+                progress: projectStats.completionPercentage,
+                status: expectedStatus
+            }, { new: true }).lean();
+
+            project = updatedProject;
         }
 
         res.status(200).json({
@@ -433,7 +548,8 @@ const updateProject = async (req, res) => {
             const subtaskCount = await Subtask.countDocuments({ projectId: id });
             if (subtaskCount > 0) {
                 delete updateData.progress; // Remove manual progress update
-                console.log('Manual progress update ignored - calculated from subtasks');
+                delete updateData.status; // Remove manual status update
+                console.log('Manual progress/status update ignored - calculated from subtasks');
             }
         }
 
@@ -450,12 +566,11 @@ const updateProject = async (req, res) => {
             });
         }
 
-        // Recalculate progress from subtasks
-        const calculatedProgress = await Subtask.getProjectProgress(id);
-        if (calculatedProgress !== project.progress) {
-            project.progress = calculatedProgress;
-            project.status = getStatusFromProgress(calculatedProgress);
-            await project.save();
+        // Recalculate progress and status from subtasks
+        const projectUpdate = await updateProjectProgressAndStatus(id);
+        if (projectUpdate && (projectUpdate.project.progress !== project.progress || projectUpdate.project.status !== project.status)) {
+            project.progress = projectUpdate.project.progress;
+            project.status = projectUpdate.project.status;
         }
 
         res.status(200).json({
@@ -762,5 +877,6 @@ module.exports = {
     deleteProject,
     getProjectStats,
     updateProjectProgress,
-    searchProjects
+    searchProjects,
+    updateProjectProgressAndStatus // Export the helper function for use in subtask controller
 };

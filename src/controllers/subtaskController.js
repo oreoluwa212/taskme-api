@@ -2,6 +2,7 @@
 const Subtask = require('../models/Subtask');
 const Project = require('../models/Project');
 const aiService = require('../services/aiService');
+const { updateProjectProgressAndStatus } = require('./projectController'); // Import the helper function
 const mongoose = require('mongoose');
 const asyncHandler = require('express-async-handler');
 
@@ -67,6 +68,9 @@ const generateSubtasks = asyncHandler(async (req, res) => {
                 userId: req.user.id
             }))
         );
+
+        // Update project progress and status after generating subtasks
+        await updateProjectProgressAndStatus(projectId);
 
         res.status(201).json({
             success: true,
@@ -154,6 +158,9 @@ const generateSubtasks = asyncHandler(async (req, res) => {
             }))
         );
 
+        // Update project progress and status after generating fallback subtasks
+        await updateProjectProgressAndStatus(projectId);
+
         res.status(201).json({
             success: true,
             data: subtasks,
@@ -203,8 +210,9 @@ const getProjectSubtasks = async (req, res) => {
             .sort(sortOptions)
             .populate('dependencies', 'title status');
 
-        // Calculate project progress
-        const progress = await Subtask.getProjectProgress(projectId);
+        // Update project progress and status
+        const projectUpdate = await updateProjectProgressAndStatus(projectId);
+        const progress = projectUpdate ? projectUpdate.stats : null;
 
         res.status(200).json({
             success: true,
@@ -264,6 +272,9 @@ const createSubtask = async (req, res) => {
 
         await subtask.save();
 
+        // Update project progress and status after creating subtask
+        await updateProjectProgressAndStatus(projectId);
+
         res.status(201).json({
             success: true,
             message: 'Subtask created successfully',
@@ -301,31 +312,47 @@ const updateSubtask = async (req, res) => {
             });
         }
 
-        const subtask = await Subtask.findOneAndUpdate(
-            { _id: subtaskId, userId: req.user.id },
-            updateData,
-            { new: true, runValidators: true }
-        );
+        // Get the original subtask to check for status changes
+        const originalSubtask = await Subtask.findOne({
+            _id: subtaskId,
+            userId: req.user.id
+        });
 
-        if (!subtask) {
+        if (!originalSubtask) {
             return res.status(404).json({
                 success: false,
                 message: 'Subtask not found'
             });
         }
 
-        // Update project progress if subtask status changed
-        if (updateData.status) {
-            const projectProgress = await Subtask.getProjectProgress(subtask.projectId);
-            await Project.findByIdAndUpdate(subtask.projectId, {
-                progress: projectProgress
-            });
+        // Add completedDate if status is being changed to Completed
+        if (updateData.status === 'Completed' && originalSubtask.status !== 'Completed') {
+            updateData.completedDate = new Date();
         }
+
+        // Remove completedDate if status is being changed from Completed to something else
+        if (updateData.status && updateData.status !== 'Completed' && originalSubtask.status === 'Completed') {
+            updateData.completedDate = null;
+        }
+
+        const subtask = await Subtask.findOneAndUpdate(
+            { _id: subtaskId, userId: req.user.id },
+            updateData,
+            { new: true, runValidators: true }
+        );
+
+        // Update project progress and status after updating subtask
+        // This is especially important when status changes
+        const projectUpdate = await updateProjectProgressAndStatus(originalSubtask.projectId);
 
         res.status(200).json({
             success: true,
             message: 'Subtask updated successfully',
-            data: subtask
+            data: subtask,
+            projectUpdate: projectUpdate ? {
+                progress: projectUpdate.project.progress,
+                status: projectUpdate.project.status
+            } : null
         });
     } catch (error) {
         console.error('Update subtask error:', error);
@@ -370,11 +397,14 @@ const deleteSubtask = async (req, res) => {
             });
         }
 
-        // Update project progress after deletion
-        const projectProgress = await Subtask.getProjectProgress(subtask.projectId);
-        await Project.findByIdAndUpdate(subtask.projectId, {
-            progress: projectProgress
-        });
+        // Remove this subtask from dependencies of other subtasks
+        await Subtask.updateMany(
+            { dependencies: subtaskId },
+            { $pull: { dependencies: subtaskId } }
+        );
+
+        // Update project progress and status after deletion
+        await updateProjectProgressAndStatus(subtask.projectId);
 
         res.status(200).json({
             success: true,
@@ -443,6 +473,81 @@ const reorderSubtasks = async (req, res) => {
         res.status(500).json({
             success: false,
             message: 'Server error while reordering subtasks'
+        });
+    }
+};
+
+// Bulk update subtasks status
+const bulkUpdateSubtasks = async (req, res) => {
+    try {
+        const { projectId } = req.params;
+        const { subtaskIds, status } = req.body;
+
+        if (!mongoose.Types.ObjectId.isValid(projectId)) {
+            return res.status(400).json({
+                success: false,
+                message: 'Invalid project ID'
+            });
+        }
+
+        if (!Array.isArray(subtaskIds) || subtaskIds.length === 0) {
+            return res.status(400).json({
+                success: false,
+                message: 'subtaskIds must be a non-empty array'
+            });
+        }
+
+        if (!['Pending', 'In Progress', 'Completed', 'Blocked'].includes(status)) {
+            return res.status(400).json({
+                success: false,
+                message: 'Invalid status value'
+            });
+        }
+
+        // Verify project belongs to user
+        const project = await Project.findOne({
+            _id: projectId,
+            userId: req.user.id
+        });
+
+        if (!project) {
+            return res.status(404).json({
+                success: false,
+                message: 'Project not found'
+            });
+        }
+
+        // Prepare update data
+        const updateData = { status };
+        if (status === 'Completed') {
+            updateData.completedDate = new Date();
+        } else {
+            updateData.completedDate = null;
+        }
+
+        // Bulk update subtasks
+        const result = await Subtask.updateMany(
+            {
+                _id: { $in: subtaskIds },
+                projectId,
+                userId: req.user.id
+            },
+            updateData
+        );
+
+        // Update project progress and status
+        await updateProjectProgressAndStatus(projectId);
+
+        res.status(200).json({
+            success: true,
+            message: `${result.modifiedCount} subtasks updated successfully`,
+            modifiedCount: result.modifiedCount
+        });
+    } catch (error) {
+        console.error('Bulk update subtasks error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Server error while bulk updating subtasks'
         });
     }
 };
@@ -741,5 +846,6 @@ module.exports = {
     updateSubtask,
     deleteSubtask,
     reorderSubtasks,
+    bulkUpdateSubtasks, // New function for bulk operations
     getSubtaskStats
 };
