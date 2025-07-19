@@ -447,20 +447,289 @@ const reorderSubtasks = async (req, res) => {
     }
 };
 
-// Get subtask statistics
+// Enhanced get subtask statistics with all subtasks data and pagination
 const getSubtaskStats = async (req, res) => {
     try {
-        const stats = await Subtask.getUserSubtaskStats(req.user.id);
+        const {
+            page = 1,
+            limit = 20,
+            sortBy = 'createdAt',
+            sortOrder = 'desc',
+            status,
+            priority,
+            dateFrom,
+            dateTo,
+            dueDateFrom,
+            dueDateTo,
+            includeCompleted = true,
+            groupBy = 'day' // day, week, month
+        } = req.query;
+
+        const userId = req.user.id;
+        const skip = (parseInt(page) - 1) * parseInt(limit);
+
+        // Build base query
+        let query = { userId: new mongoose.Types.ObjectId(userId) };
+
+        // Apply filters
+        if (status) query.status = status;
+        if (priority) query.priority = priority;
+        if (includeCompleted === 'false') query.status = { $ne: 'Completed' };
+
+        // Date range filters for creation date
+        if (dateFrom || dateTo) {
+            query.createdAt = {};
+            if (dateFrom) query.createdAt.$gte = new Date(dateFrom);
+            if (dateTo) query.createdAt.$lte = new Date(dateTo + 'T23:59:59.999Z');
+        }
+
+        // Date range filters for due date
+        if (dueDateFrom || dueDateTo) {
+            query.dueDate = {};
+            if (dueDateFrom) query.dueDate.$gte = new Date(dueDateFrom);
+            if (dueDateTo) query.dueDate.$lte = new Date(dueDateTo + 'T23:59:59.999Z');
+        }
+
+        // Sort options
+        const sortOptions = {};
+        sortOptions[sortBy] = sortOrder === 'asc' ? 1 : -1;
+
+        // Get paginated subtasks with project details
+        const subtasks = await Subtask.find(query)
+            .sort(sortOptions)
+            .skip(skip)
+            .limit(parseInt(limit))
+            .populate('projectId', 'title description category priority')
+            .populate('dependencies', 'title status')
+            .lean();
+
+        // Get total count for pagination
+        const totalCount = await Subtask.countDocuments(query);
+        const totalPages = Math.ceil(totalCount / parseInt(limit));
+
+        // Get overall statistics
+        const stats = await Subtask.aggregate([
+            { $match: { userId: new mongoose.Types.ObjectId(userId) } },
+            {
+                $group: {
+                    _id: '$status',
+                    count: { $sum: 1 },
+                    totalHours: { $sum: '$estimatedHours' },
+                    actualHours: { $sum: '$actualHours' }
+                }
+            }
+        ]);
+
+        // Format stats
+        const formattedStats = {
+            total: 0,
+            pending: 0,
+            inProgress: 0,
+            completed: 0,
+            blocked: 0,
+            totalEstimatedHours: 0,
+            totalActualHours: 0
+        };
+
+        stats.forEach(stat => {
+            formattedStats.total += stat.count;
+            formattedStats.totalEstimatedHours += stat.totalHours || 0;
+            formattedStats.totalActualHours += stat.actualHours || 0;
+
+            switch (stat._id) {
+                case 'Pending': formattedStats.pending = stat.count; break;
+                case 'In Progress': formattedStats.inProgress = stat.count; break;
+                case 'Completed': formattedStats.completed = stat.count; break;
+                case 'Blocked': formattedStats.blocked = stat.count; break;
+            }
+        });
+
+        // Get overdue tasks count
+        const overdueCount = await Subtask.countDocuments({
+            userId: new mongoose.Types.ObjectId(userId),
+            dueDate: { $lt: new Date() },
+            status: { $nin: ['Completed'] }
+        });
+
+        formattedStats.overdueTasks = overdueCount;
+
+        // Get time-based grouping
+        let groupFormat;
+        switch (groupBy) {
+            case 'week':
+                groupFormat = { $dateToString: { format: "%Y-W%U", date: "$createdAt" } };
+                break;
+            case 'month':
+                groupFormat = { $dateToString: { format: "%Y-%m", date: "$createdAt" } };
+                break;
+            default: // day
+                groupFormat = { $dateToString: { format: "%Y-%m-%d", date: "$createdAt" } };
+        }
+
+        const timeGroupedStats = await Subtask.aggregate([
+            { $match: query },
+            {
+                $group: {
+                    _id: groupFormat,
+                    count: { $sum: 1 },
+                    completed: {
+                        $sum: { $cond: [{ $eq: ["$status", "Completed"] }, 1, 0] }
+                    },
+                    pending: {
+                        $sum: { $cond: [{ $eq: ["$status", "Pending"] }, 1, 0] }
+                    },
+                    inProgress: {
+                        $sum: { $cond: [{ $eq: ["$status", "In Progress"] }, 1, 0] }
+                    },
+                    blocked: {
+                        $sum: { $cond: [{ $eq: ["$status", "Blocked"] }, 1, 0] }
+                    },
+                    totalEstimatedHours: { $sum: '$estimatedHours' }
+                }
+            },
+            { $sort: { _id: -1 } },
+            { $limit: 30 } // Last 30 time periods
+        ]);
+
+        // Get priority distribution
+        const priorityStats = await Subtask.aggregate([
+            { $match: query },
+            {
+                $group: {
+                    _id: '$priority',
+                    count: { $sum: 1 },
+                    completedCount: {
+                        $sum: { $cond: [{ $eq: ["$status", "Completed"] }, 1, 0] }
+                    }
+                }
+            }
+        ]);
+
+        // Get project-wise breakdown
+        const projectStats = await Subtask.aggregate([
+            { $match: query },
+            {
+                $group: {
+                    _id: '$projectId',
+                    count: { $sum: 1 },
+                    completed: {
+                        $sum: { $cond: [{ $eq: ["$status", "Completed"] }, 1, 0] }
+                    },
+                    totalHours: { $sum: '$estimatedHours' }
+                }
+            },
+            {
+                $lookup: {
+                    from: 'projects',
+                    localField: '_id',
+                    foreignField: '_id',
+                    as: 'project'
+                }
+            },
+            { $unwind: '$project' },
+            {
+                $project: {
+                    projectTitle: '$project.title',
+                    projectCategory: '$project.category',
+                    count: 1,
+                    completed: 1,
+                    totalHours: 1,
+                    completionRate: {
+                        $cond: [
+                            { $eq: ['$count', 0] },
+                            0,
+                            { $multiply: [{ $divide: ['$completed', '$count'] }, 100] }
+                        ]
+                    }
+                }
+            },
+            { $sort: { count: -1 } },
+            { $limit: 10 } // Top 10 projects by task count
+        ]);
+
+        // Calculate productivity insights
+        const now = new Date();
+        const lastWeek = new Date(now - 7 * 24 * 60 * 60 * 1000);
+        const lastMonth = new Date(now - 30 * 24 * 60 * 60 * 1000);
+
+        const productivityInsights = {
+            thisWeek: await Subtask.countDocuments({
+                userId: new mongoose.Types.ObjectId(userId),
+                completedDate: { $gte: lastWeek },
+                status: 'Completed'
+            }),
+            thisMonth: await Subtask.countDocuments({
+                userId: new mongoose.Types.ObjectId(userId),
+                completedDate: { $gte: lastMonth },
+                status: 'Completed'
+            }),
+            averageCompletionTime: await Subtask.aggregate([
+                {
+                    $match: {
+                        userId: new mongoose.Types.ObjectId(userId),
+                        status: 'Completed',
+                        createdAt: { $exists: true },
+                        completedDate: { $exists: true }
+                    }
+                },
+                {
+                    $project: {
+                        completionTimeHours: {
+                            $divide: [
+                                { $subtract: ['$completedDate', '$createdAt'] },
+                                1000 * 60 * 60 // Convert to hours
+                            ]
+                        }
+                    }
+                },
+                {
+                    $group: {
+                        _id: null,
+                        avgCompletionTime: { $avg: '$completionTimeHours' }
+                    }
+                }
+            ])
+        };
 
         res.status(200).json({
             success: true,
-            data: stats
+            data: {
+                subtasks,
+                pagination: {
+                    currentPage: parseInt(page),
+                    totalPages,
+                    totalCount,
+                    hasNext: parseInt(page) < totalPages,
+                    hasPrev: parseInt(page) > 1,
+                    limit: parseInt(limit)
+                },
+                statistics: {
+                    overview: formattedStats,
+                    timeGrouped: timeGroupedStats,
+                    priority: priorityStats,
+                    projects: projectStats,
+                    productivity: productivityInsights
+                },
+                filters: {
+                    status,
+                    priority,
+                    dateFrom,
+                    dateTo,
+                    dueDateFrom,
+                    dueDateTo,
+                    groupBy,
+                    sortBy,
+                    sortOrder
+                }
+            }
         });
+
     } catch (error) {
         console.error('Get subtask stats error:', error);
         res.status(500).json({
             success: false,
-            message: 'Server error while fetching subtask statistics'
+            message: 'Server error while fetching subtask statistics',
+            error: process.env.NODE_ENV === 'development' ? error.message : undefined
         });
     }
 };
