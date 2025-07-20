@@ -25,6 +25,37 @@ const userSchema = new mongoose.Schema(
             required: true,
             minlength: 6,
         },
+        phoneNumber: {
+            type: String,
+            trim: true,
+            default: null,
+        },
+        location: {
+            type: String,
+            trim: true,
+            default: null,
+        },
+        timezone: {
+            type: String,
+            enum: ['Pacific Time', 'Eastern Time', 'Central Time', 'Mountain Time'],
+            default: 'Pacific Time',
+        },
+        bio: {
+            type: String,
+            trim: true,
+            maxlength: 500,
+            default: null,
+        },
+        avatar: {
+            public_id: {
+                type: String,
+                default: null,
+            },
+            url: {
+                type: String,
+                default: null,
+            }
+        },
         emailVerified: {
             type: Boolean,
             default: false,
@@ -34,7 +65,7 @@ const userSchema = new mongoose.Schema(
         resetCode: {
             type: String,
             validate: {
-                validator: (v) => /^\d{5}$/.test(v),
+                validator: (v) => !v || /^\d{5}$/.test(v),
                 message: (props) => `${props.value} is not a valid 5-digit code`,
             },
         },
