@@ -2,7 +2,7 @@
 const Subtask = require('../models/Subtask');
 const Project = require('../models/Project');
 const aiService = require('../services/aiService');
-const { updateProjectProgressAndStatus } = require('./projectController'); // Import the helper function
+const { updateProjectProgressAndStatus } = require('./projectController');
 const mongoose = require('mongoose');
 const asyncHandler = require('express-async-handler');
 
@@ -28,23 +28,35 @@ const generateSubtasks = asyncHandler(async (req, res) => {
     // Prepare project data for AI service
     const projectData = {
         name: project.title,
+        title: project.title, // Add both for compatibility
         description: project.description,
-        timeline: project.timeline || 30, // Default to 30 days if not specified
+        timeline: project.timeline || 30,
         startDate: project.startDate || new Date().toISOString(),
-        dueDate: project.dueDate || new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(), // 30 days from now
+        dueDate: project.dueDate || new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(),
         priority: project.priority || 'Medium',
         category: project.category || 'General'
     };
 
     try {
-        // Use the correct method from aiService
-        const aiResponse = await aiService.generateProjectTasks(projectData);
+        let aiResponse;
 
-        if (!aiResponse.subtasks || !Array.isArray(aiResponse.subtasks)) {
-            return res.status(400).json({
-                success: false,
-                message: 'Failed to generate valid subtasks from AI'
-            });
+        // Try to use the correct method based on your aiService structure
+        if (aiService.aiChatService && typeof aiService.aiChatService.generateProjectTasks === 'function') {
+            // If aiService exports { aiChatService, aiProjectService }
+            aiResponse = await aiService.aiChatService.generateProjectTasks(projectData);
+        } else if (aiService.generateProjectTasks && typeof aiService.generateProjectTasks === 'function') {
+            // If aiService directly exports the method
+            aiResponse = await aiService.generateProjectTasks(projectData);
+        } else if (aiService.aiProjectService && typeof aiService.aiProjectService.generateProjectTasks === 'function') {
+            // If there's an aiProjectService
+            aiResponse = await aiService.aiProjectService.generateProjectTasks(projectData);
+        } else {
+            // If none of the above work, throw an error to trigger fallback
+            throw new Error('generateProjectTasks method not found in aiService');
+        }
+
+        if (!aiResponse || !aiResponse.subtasks || !Array.isArray(aiResponse.subtasks)) {
+            throw new Error('Invalid AI response format');
         }
 
         // Convert AI response to subtasks format
@@ -56,7 +68,7 @@ const generateSubtasks = asyncHandler(async (req, res) => {
                 order: task.order || (index + 1),
                 priority: task.priority || 'Medium',
                 estimatedHours: task.estimatedHours || 2,
-                status: 'Pending', // Fixed: Use proper enum value
+                status: 'Pending',
                 aiGenerated: true,
                 phase: task.phase || 'Execution',
                 complexity: task.complexity || 'Medium',
@@ -149,7 +161,7 @@ const generateSubtasks = asyncHandler(async (req, res) => {
                 ...task,
                 projectId,
                 userId: req.user.id,
-                status: 'Pending', // Fixed: Use proper enum value
+                status: 'Pending',
                 aiGenerated: false,
                 complexity: 'Medium',
                 riskLevel: 'Low',
@@ -846,6 +858,6 @@ module.exports = {
     updateSubtask,
     deleteSubtask,
     reorderSubtasks,
-    bulkUpdateSubtasks, // New function for bulk operations
+    bulkUpdateSubtasks,
     getSubtaskStats
 };

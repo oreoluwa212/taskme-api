@@ -1,4 +1,4 @@
-// src/routes/chatRoutes.js - Enhanced with suggestions
+// src/routes/chatRoutes.js
 const express = require('express');
 const {
     getChats,
