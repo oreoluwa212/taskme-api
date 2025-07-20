@@ -1,10 +1,112 @@
 // src/controllers/subtaskController.js
 const Subtask = require('../models/Subtask');
 const Project = require('../models/Project');
-const aiService = require('../services/aiService');
+const { AIProjectService, AIChatService } = require('../services/aiService');
 const { updateProjectProgressAndStatus } = require('./projectController');
 const mongoose = require('mongoose');
 const asyncHandler = require('express-async-handler');
+
+// ============================================================================
+// HELPER METHODS FOR AI INTEGRATION
+// ============================================================================
+
+// Helper method for generating basic tasks from chat extraction
+const generateBasicTasksFromExtraction = async (extractedProject, projectData) => {
+    const basicPhases = ['Planning', 'Execution', 'Review'];
+    const tasksPerPhase = Math.ceil(6 / basicPhases.length);
+
+    const subtasks = [];
+    let order = 1;
+
+    basicPhases.forEach((phase, phaseIndex) => {
+        for (let i = 0; i < tasksPerPhase && subtasks.length < 6; i++) {
+            subtasks.push({
+                title: `${phase} Task ${i + 1} for ${projectData.name}`,
+                description: `${phase} activities for ${projectData.description?.substring(0, 100)}...`,
+                order: order++,
+                priority: phaseIndex === 0 ? 'High' : 'Medium',
+                estimatedHours: Math.ceil(projectData.timeline / 6),
+                phase: phase,
+                complexity: extractedProject.estimatedComplexity || 'Medium'
+            });
+        }
+    });
+
+    return {
+        subtasks,
+        totalEstimatedHours: subtasks.reduce((sum, task) => sum + task.estimatedHours, 0),
+        criticalPath: [0, Math.floor(subtasks.length / 2), subtasks.length - 1],
+        generatedFrom: 'chat_extraction'
+    };
+};
+
+// Enhanced fallback subtask generation
+const generateFallbackSubtasks = (project) => {
+    const timelineFactor = Math.max(1, Math.floor((project.timeline || 30) / 7));
+
+    return [
+        {
+            title: 'Project Planning and Requirements Analysis',
+            description: `Comprehensive planning for "${project.title}" including scope definition, requirements gathering, and resource planning`,
+            order: 1,
+            priority: 'High',
+            estimatedHours: 4 * timelineFactor,
+            phase: 'Planning'
+        },
+        {
+            title: 'Research and Competitive Analysis',
+            description: 'Market research, competitor analysis, and best practices identification',
+            order: 2,
+            priority: 'High',
+            estimatedHours: 6 * timelineFactor,
+            phase: 'Planning'
+        },
+        {
+            title: 'System Design and Architecture',
+            description: 'Create detailed design documents, system architecture, and technical specifications',
+            order: 3,
+            priority: 'High',
+            estimatedHours: 8 * timelineFactor,
+            phase: 'Planning'
+        },
+        {
+            title: 'Core Development and Implementation',
+            description: `Develop the main features and functionality for ${project.title}`,
+            order: 4,
+            priority: 'High',
+            estimatedHours: 16 * timelineFactor,
+            phase: 'Execution'
+        },
+        {
+            title: 'Integration and System Testing',
+            description: 'Integrate all components, perform system testing, and resolve integration issues',
+            order: 5,
+            priority: 'Medium',
+            estimatedHours: 8 * timelineFactor,
+            phase: 'Review'
+        },
+        {
+            title: 'User Acceptance Testing and Deployment',
+            description: 'Conduct user testing, gather feedback, and deploy the final solution',
+            order: 6,
+            priority: 'Medium',
+            estimatedHours: 6 * timelineFactor,
+            phase: 'Review'
+        },
+        {
+            title: 'Documentation and Knowledge Transfer',
+            description: 'Create comprehensive documentation and conduct knowledge transfer sessions',
+            order: 7,
+            priority: 'Low',
+            estimatedHours: 4 * timelineFactor,
+            phase: 'Review'
+        }
+    ];
+};
+
+// ============================================================================
+// MAIN CONTROLLER METHODS
+// ============================================================================
 
 // Generate AI-powered subtasks for a project
 const generateSubtasks = asyncHandler(async (req, res) => {
@@ -28,7 +130,7 @@ const generateSubtasks = asyncHandler(async (req, res) => {
     // Prepare project data for AI service
     const projectData = {
         name: project.title,
-        title: project.title, // Add both for compatibility
+        title: project.title,
         description: project.description,
         timeline: project.timeline || 30,
         startDate: project.startDate || new Date().toISOString(),
@@ -40,18 +142,34 @@ const generateSubtasks = asyncHandler(async (req, res) => {
     try {
         let aiResponse;
 
-        // Fixed: Use the correct method from the aiService structure
-        if (typeof aiService.generateProjectTasks === 'function') {
-            // Direct method call (based on your module.exports)
-            aiResponse = await aiService.generateProjectTasks(projectData);
-        } else if (aiService.aiChatService && typeof aiService.aiChatService.generateProjectTasks === 'function') {
-            // If aiChatService is available
-            aiResponse = await aiService.aiChatService.generateProjectTasks(projectData);
-        } else {
-            // If none of the above work, throw an error to trigger fallback
-            throw new Error('generateProjectTasks method not found in aiService');
+        // CORRECTED METHOD CALL - Using the proper service instance
+        try {
+            // Method 1: Using AIProjectService directly (recommended)
+            aiResponse = await AIProjectService.generateProjectTasks(projectData);
+            console.log('✅ Successfully used AIProjectService.generateProjectTasks');
+        } catch (aiError) {
+            console.log('❌ AIProjectService failed, trying fallback methods:', aiError.message);
+
+            // Method 2: Try alternative method names or chat service extraction
+            try {
+                // Try the chat service's project extraction as fallback
+                const extractedProject = AIChatService.extractProjectFromConversation([
+                    { sender: 'user', content: project.description }
+                ]);
+
+                if (extractedProject && extractedProject.hasProject) {
+                    aiResponse = await generateBasicTasksFromExtraction(extractedProject, projectData);
+                    console.log('✅ Used chat service extraction as fallback');
+                } else {
+                    throw new Error('Chat service extraction failed');
+                }
+            } catch (fallbackError) {
+                console.log('❌ All AI methods failed:', fallbackError.message);
+                throw new Error('All AI service methods failed');
+            }
         }
 
+        // Validate AI response
         if (!aiResponse || !aiResponse.subtasks || !Array.isArray(aiResponse.subtasks)) {
             throw new Error('Invalid AI response format');
         }
@@ -78,7 +196,7 @@ const generateSubtasks = asyncHandler(async (req, res) => {
             }))
         );
 
-        // Update project progress and status after generating subtasks
+        // Update project progress and status
         await updateProjectProgressAndStatus(projectId);
 
         res.status(201).json({
@@ -94,64 +212,16 @@ const generateSubtasks = asyncHandler(async (req, res) => {
                 projectInsights: aiResponse.projectInsights,
                 recommendedTeamSize: aiResponse.recommendedTeamSize,
                 estimatedBudget: aiResponse.estimatedBudget,
-                successMetrics: aiResponse.successMetrics
+                successMetrics: aiResponse.successMetrics,
+                serviceUsed: aiResponse.fromCache ? 'cached' : 'ai_generated'
             }
         });
 
     } catch (error) {
         console.error('AI subtask generation error:', error);
 
-        // Enhanced fallback to simple subtask generation with better error handling
-        const fallbackSubtasks = [
-            {
-                title: 'Project Planning and Setup',
-                description: `Define project scope for "${project.title}" and set up initial structure`,
-                order: 1,
-                priority: 'High',
-                estimatedHours: 4,
-                phase: 'Planning'
-            },
-            {
-                title: 'Research and Analysis',
-                description: 'Conduct necessary research and analyze requirements for the project',
-                order: 2,
-                priority: 'High',
-                estimatedHours: 6,
-                phase: 'Planning'
-            },
-            {
-                title: 'Design and Architecture',
-                description: 'Create design documents and system architecture',
-                order: 3,
-                priority: 'High',
-                estimatedHours: 8,
-                phase: 'Planning'
-            },
-            {
-                title: 'Core Implementation',
-                description: `Implement the main features and functionality for ${project.title}`,
-                order: 4,
-                priority: 'High',
-                estimatedHours: 16,
-                phase: 'Execution'
-            },
-            {
-                title: 'Testing and Quality Assurance',
-                description: 'Test all components and ensure quality standards',
-                order: 5,
-                priority: 'Medium',
-                estimatedHours: 6,
-                phase: 'Review'
-            },
-            {
-                title: 'Documentation and Deployment',
-                description: 'Create documentation and deploy the solution',
-                order: 6,
-                priority: 'Medium',
-                estimatedHours: 4,
-                phase: 'Review'
-            }
-        ];
+        // Enhanced fallback subtask generation
+        const fallbackSubtasks = generateFallbackSubtasks(project);
 
         try {
             const subtasks = await Subtask.insertMany(
@@ -170,7 +240,6 @@ const generateSubtasks = asyncHandler(async (req, res) => {
                 }))
             );
 
-            // Update project progress and status after generating fallback subtasks
             await updateProjectProgressAndStatus(projectId);
 
             res.status(201).json({
@@ -190,6 +259,56 @@ const generateSubtasks = asyncHandler(async (req, res) => {
         }
     }
 });
+
+// ============================================================================
+// ADDITIONAL HELPER METHODS FOR AI INTEGRATION
+// ============================================================================
+
+// Method to test AI service connectivity
+const testAIConnection = async (req, res) => {
+    try {
+        // Test both services
+        const projectTest = await AIProjectService.testConnection?.() || { success: false, message: 'Method not available' };
+        const chatTest = await AIChatService.testConnection();
+
+        res.status(200).json({
+            success: true,
+            services: {
+                projectService: projectTest,
+                chatService: chatTest
+            },
+            timestamp: new Date().toISOString()
+        });
+    } catch (error) {
+        res.status(500).json({
+            success: false,
+            message: 'AI service test failed',
+            error: error.message
+        });
+    }
+};
+
+// Method to get AI service usage statistics
+const getAIUsageStats = async (req, res) => {
+    try {
+        const chatStats = AIChatService.getUsageStats();
+
+        res.status(200).json({
+            success: true,
+            usage: chatStats,
+            cacheInfo: {
+                projectPatternsSize: AIProjectService.projectPatterns?.size || 0,
+                chatCacheSize: chatStats.cacheSize
+            }
+        });
+    } catch (error) {
+        res.status(500).json({
+            success: false,
+            message: 'Failed to get AI usage statistics',
+            error: error.message
+        });
+    }
+};
 
 // Get all subtasks for a project
 const getProjectSubtasks = async (req, res) => {
@@ -770,13 +889,8 @@ const getSubtaskStats = async (req, res) => {
                 }
             },
             { $sort: { count: -1 } },
-            { $limit: 10 } // Top 10 projects by task count
+            { $limit: 10 }
         ]);
-
-        // Calculate productivity insights
-        const now = new Date();
-        const lastWeek = new Date(now - 7 * 24 * 60 * 60 * 1000);
-        const lastMonth = new Date(now - 30 * 24 * 60 * 60 * 1000);
 
         const productivityInsights = {
             thisWeek: await Subtask.countDocuments({

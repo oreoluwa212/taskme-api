@@ -21,20 +21,19 @@ class AIChatService {
         });
 
         // Initialize caches and counters
-        this.responseCache = new Map(); // In-memory cache for responses
-        this.userRequestCounts = new Map(); // Track user requests
+        this.responseCache = new Map();
+        this.userRequestCounts = new Map();
         this.commonResponses = this.initializeCommonResponses();
         this.dailyRequestCount = 0;
         this.lastResetDate = new Date().toDateString();
 
         // Configuration
-        this.MAX_DAILY_REQUESTS = 45; // Leave 5 requests as buffer
+        this.MAX_DAILY_REQUESTS = 45;
         this.MAX_USER_REQUESTS_PER_HOUR = 5;
-        this.CACHE_TTL = 60 * 60 * 1000; // 1 hour cache TTL
-        this.CACHE_MAX_SIZE = 100; // Maximum cached responses
+        this.CACHE_TTL = 60 * 60 * 1000; // 1 hour
+        this.CACHE_MAX_SIZE = 100;
     }
 
-    // Reset daily counters if new day
     checkDailyReset() {
         const today = new Date().toDateString();
         if (today !== this.lastResetDate) {
@@ -45,18 +44,14 @@ class AIChatService {
         }
     }
 
-    // Check if user has exceeded rate limit
     checkUserRateLimit(userId) {
         this.checkDailyReset();
-
         const now = Date.now();
-        const userKey = `${userId}_${Math.floor(now / (60 * 60 * 1000))}`; // Hour-based key
+        const userKey = `${userId}_${Math.floor(now / (60 * 60 * 1000))}`;
         const userCount = this.userRequestCounts.get(userKey) || 0;
-
         return userCount < this.MAX_USER_REQUESTS_PER_HOUR;
     }
 
-    // Increment user request count
     incrementUserCount(userId) {
         const now = Date.now();
         const userKey = `${userId}_${Math.floor(now / (60 * 60 * 1000))}`;
@@ -65,17 +60,14 @@ class AIChatService {
         this.dailyRequestCount++;
     }
 
-    // Generate cache key from user message
     generateCacheKey(userMessage, context = {}) {
         const normalizedMessage = userMessage.toLowerCase().trim();
         const contextString = JSON.stringify(context.recentMessages || []);
         return crypto.createHash('md5').update(normalizedMessage + contextString).digest('hex');
     }
 
-    // Check common responses first (no API call needed)
     checkCommonResponses(userMessage) {
         const message = userMessage.toLowerCase().trim();
-
         for (const [pattern, response] of this.commonResponses) {
             if (message.includes(pattern)) {
                 return {
@@ -88,7 +80,6 @@ class AIChatService {
         return null;
     }
 
-    // Initialize common responses to avoid API calls
     initializeCommonResponses() {
         return new Map([
             ['hello', "Hello! I'm here to help you with your projects and tasks. What can I assist you with today?"],
@@ -102,7 +93,6 @@ class AIChatService {
         ]);
     }
 
-    // Check cache for similar responses
     getCachedResponse(cacheKey) {
         const cached = this.responseCache.get(cacheKey);
         if (cached && (Date.now() - cached.timestamp) < this.CACHE_TTL) {
@@ -111,44 +101,49 @@ class AIChatService {
                 cached: true
             };
         }
-
-        // Remove expired cache entry
         if (cached) {
             this.responseCache.delete(cacheKey);
         }
-
         return null;
     }
 
-    // Store response in cache
     cacheResponse(cacheKey, response) {
-        // Implement LRU-like behavior by removing oldest entries
         if (this.responseCache.size >= this.CACHE_MAX_SIZE) {
             const oldestKey = this.responseCache.keys().next().value;
             this.responseCache.delete(oldestKey);
         }
-
         this.responseCache.set(cacheKey, {
             response: { ...response, cached: false },
             timestamp: Date.now()
         });
     }
 
-    // Main optimized chat response method
+    buildConversationContext(recentMessages = []) {
+        if (!recentMessages || recentMessages.length === 0) {
+            return '';
+        }
+        const contextMessages = recentMessages
+            .slice(-3)
+            .map(msg => `${msg.sender === 'user' ? 'User' : 'Assistant'}: ${msg.content}`)
+            .join('\n');
+        return `Previous conversation:\n${contextMessages}\n\n`;
+    }
+
+    // MAIN CHAT RESPONSE METHOD - This is what should be called
     async generateChatResponse(userMessage, context = {}) {
         const userId = context.userId || 'anonymous';
 
         try {
             this.checkDailyReset();
 
-            // 1. Check common responses first (no API call)
+            // Check common responses first
             const commonResponse = this.checkCommonResponses(userMessage);
             if (commonResponse) {
                 console.log('Returned common response, no API call needed');
                 return commonResponse;
             }
 
-            // 2. Check cache
+            // Check cache
             const cacheKey = this.generateCacheKey(userMessage, context);
             const cachedResponse = this.getCachedResponse(cacheKey);
             if (cachedResponse) {
@@ -156,7 +151,7 @@ class AIChatService {
                 return cachedResponse;
             }
 
-            // 3. Check daily API limit
+            // Check daily API limit
             if (this.dailyRequestCount >= this.MAX_DAILY_REQUESTS) {
                 return {
                     message: "I've reached the daily API limit to keep costs low. I'll be back tomorrow with fresh responses! In the meantime, I can help with basic questions using my cached knowledge.",
@@ -165,7 +160,7 @@ class AIChatService {
                 };
             }
 
-            // 4. Check user rate limit
+            // Check user rate limit
             if (!this.checkUserRateLimit(userId)) {
                 return {
                     message: "You've reached the hourly limit of 5 requests. This helps me serve all users fairly with our limited daily API quota. Please try again in an hour!",
@@ -174,7 +169,7 @@ class AIChatService {
                 };
             }
 
-            // 5. Make API call
+            // Make API call
             console.log(`Making API call (${this.dailyRequestCount + 1}/${this.MAX_DAILY_REQUESTS})`);
 
             const conversationContext = this.buildConversationContext(context.recentMessages);
@@ -198,7 +193,6 @@ Please provide a helpful, conversational response. If the user is describing a p
                 throw new Error('Empty response from Gemini API');
             }
 
-            // Increment counters
             this.incrementUserCount(userId);
 
             const finalResponse = {
@@ -208,7 +202,6 @@ Please provide a helpful, conversational response. If the user is describing a p
                 apiCallsRemaining: this.MAX_DAILY_REQUESTS - this.dailyRequestCount
             };
 
-            // Cache the response
             this.cacheResponse(cacheKey, finalResponse);
 
             console.log(`API call successful. Remaining today: ${this.MAX_DAILY_REQUESTS - this.dailyRequestCount}`);
@@ -216,8 +209,6 @@ Please provide a helpful, conversational response. If the user is describing a p
 
         } catch (error) {
             console.error('Error in generateChatResponse:', error);
-
-            // Don't increment counter on API errors
             return {
                 message: "I'm experiencing some technical difficulties. Let me try to help you with a general response based on my knowledge.",
                 type: 'fallback',
@@ -227,7 +218,13 @@ Please provide a helpful, conversational response. If the user is describing a p
         }
     }
 
-    // OPTIMIZED: Simple rule-based project extraction (NO API CALL)
+    // ALIAS METHOD - Add this for backward compatibility if other code calls the wrong method name
+    async generateEnhancedChatResponse(userMessage, context = {}) {
+        console.warn('DEPRECATED: generateEnhancedChatResponse is deprecated, use generateChatResponse instead');
+        return this.generateChatResponse(userMessage, context);
+    }
+
+    // Rule-based project extraction
     extractProjectFromConversation(messages = []) {
         try {
             if (!messages || messages.length === 0) {
@@ -235,10 +232,9 @@ Please provide a helpful, conversational response. If the user is describing a p
                 return null;
             }
 
-            // Get recent user messages
             const userMessages = messages
                 .filter(msg => msg.sender === 'user')
-                .slice(-3) // Get last 3 user messages
+                .slice(-3)
                 .map(msg => msg.content.toLowerCase());
 
             if (userMessages.length === 0) {
@@ -246,7 +242,6 @@ Please provide a helpful, conversational response. If the user is describing a p
                 return null;
             }
 
-            // Simple keyword-based project detection
             const projectKeywords = [
                 'project', 'build', 'create', 'develop', 'make', 'design',
                 'plan', 'organize', 'goal', 'task', 'website', 'app',
@@ -269,7 +264,6 @@ Please provide a helpful, conversational response. If the user is describing a p
                 'Personal': ['personal', 'hobby', 'learning', 'skill', 'improvement']
             };
 
-            // Check if any message contains project keywords
             const hasProjectKeywords = userMessages.some(msg =>
                 projectKeywords.some(keyword => msg.includes(keyword))
             );
@@ -279,16 +273,13 @@ Please provide a helpful, conversational response. If the user is describing a p
                 return null;
             }
 
-            // Extract information from the most recent message
             const latestMessage = messages.filter(msg => msg.sender === 'user').slice(-1)[0];
             const messageContent = latestMessage.content;
 
-            // Generate basic project data without API call
             const today = new Date();
             const dueDate = new Date();
-            dueDate.setDate(today.getDate() + 30); // Default 30 days
+            dueDate.setDate(today.getDate() + 30);
 
-            // Determine category based on keywords
             let category = 'Other';
             for (const [cat, keywords] of Object.entries(categoryKeywords)) {
                 if (keywords.some(keyword => messageContent.toLowerCase().includes(keyword))) {
@@ -297,7 +288,6 @@ Please provide a helpful, conversational response. If the user is describing a p
                 }
             }
 
-            // Determine complexity
             let complexity = 'Medium';
             for (const [level, keywords] of Object.entries(complexityKeywords)) {
                 if (keywords.some(keyword => messageContent.toLowerCase().includes(keyword))) {
@@ -306,7 +296,6 @@ Please provide a helpful, conversational response. If the user is describing a p
                 }
             }
 
-            // Generate title from message (first 50 chars, cleaned up)
             let title = messageContent.replace(/[^\w\s]/g, '').substring(0, 50).trim();
             if (!title) {
                 title = 'New Project';
@@ -314,16 +303,14 @@ Please provide a helpful, conversational response. If the user is describing a p
                 title = `${title} Project`;
             }
 
-            // Estimate timeline based on complexity
             const timelineMap = { 'Low': 14, 'Medium': 30, 'High': 60 };
             const timeline = timelineMap[complexity] || 30;
-
             dueDate.setDate(today.getDate() + timeline);
 
             const projectData = {
                 hasProject: true,
                 title: title,
-                description: messageContent.substring(0, 200), // First 200 chars as description
+                description: messageContent.substring(0, 200),
                 timeline: timeline,
                 startDate: today.toISOString().split('T')[0],
                 dueDate: dueDate.toISOString().split('T')[0],
@@ -342,7 +329,6 @@ Please provide a helpful, conversational response. If the user is describing a p
         }
     }
 
-    // Helper method to extract tags from message content
     extractTagsFromMessage(content) {
         const commonTags = {
             'web': ['website', 'web', 'html', 'css', 'javascript'],
@@ -363,10 +349,9 @@ Please provide a helpful, conversational response. If the user is describing a p
             }
         }
 
-        return tags.slice(0, 5); // Limit to 5 tags
+        return tags.slice(0, 5);
     }
 
-    // Generate project tasks with better error handling
     async generateProjectTasks(projectData) {
         const today = new Date().toISOString().split('T')[0];
         const startDate = projectData.startDate || today;
@@ -420,7 +405,6 @@ CRITICAL: Respond with valid JSON only. No markdown, no extra text, no comments.
 }`;
 
         try {
-            // Check if we have enough quota for task generation
             if (this.dailyRequestCount >= this.MAX_DAILY_REQUESTS) {
                 console.log('API quota exhausted, using fallback tasks');
                 return this.generateFallbackTasks(projectData);
@@ -430,28 +414,22 @@ CRITICAL: Respond with valid JSON only. No markdown, no extra text, no comments.
             const result = await this.model.generateContent(prompt);
             let response = result.response.text().trim();
 
-            // Clean up the response - remove markdown formatting
             response = response.replace(/```json\s*/g, '').replace(/```\s*/g, '');
-
-            // Find JSON in the response
             const jsonMatch = response.match(/\{[\s\S]*\}$/);
 
             if (jsonMatch) {
                 const tasksResponse = JSON.parse(jsonMatch[0]);
                 this.incrementUserCount('system');
 
-                // Validate and fix the response structure
                 if (!tasksResponse.subtasks || !Array.isArray(tasksResponse.subtasks)) {
                     throw new Error('Invalid subtasks structure');
                 }
 
-                // Ensure required fields and calculate dates
                 const projectStart = new Date(startDate);
                 const projectEnd = new Date(endDate);
                 const totalDays = Math.max(1, Math.ceil((projectEnd - projectStart) / (1000 * 60 * 60 * 24)));
 
                 tasksResponse.subtasks = tasksResponse.subtasks.map((task, index) => {
-                    // Calculate task dates
                     const taskStartOffset = Math.floor((index / tasksResponse.subtasks.length) * totalDays);
                     const taskDuration = Math.ceil((task.estimatedHours || 4) / 8) || 1;
 
@@ -477,7 +455,6 @@ CRITICAL: Respond with valid JSON only. No markdown, no extra text, no comments.
                     };
                 });
 
-                // Ensure other fields have defaults
                 tasksResponse.totalEstimatedHours = tasksResponse.subtasks.reduce((sum, task) => sum + (task.estimatedHours || 0), 0);
                 tasksResponse.criticalPath = tasksResponse.criticalPath || [];
                 tasksResponse.milestones = tasksResponse.milestones || [];
@@ -495,13 +472,10 @@ CRITICAL: Respond with valid JSON only. No markdown, no extra text, no comments.
             throw new Error('No valid JSON found in response');
         } catch (error) {
             console.error('Error generating project tasks:', error);
-
-            // Return fallback tasks
             return this.generateFallbackTasks(projectData);
         }
     }
 
-    // Generate fallback tasks when AI fails
     generateFallbackTasks(projectData) {
         const today = new Date().toISOString().split('T')[0];
         const dueDate = projectData.dueDate || (() => {
@@ -584,7 +558,6 @@ CRITICAL: Respond with valid JSON only. No markdown, no extra text, no comments.
         };
     }
 
-    // Get usage statistics
     getUsageStats() {
         this.checkDailyReset();
         return {
@@ -597,29 +570,13 @@ CRITICAL: Respond with valid JSON only. No markdown, no extra text, no comments.
         };
     }
 
-    // Calculate cache hit rate (simplified)
     calculateCacheHitRate() {
-        // This is a simplified calculation - you might want to implement proper metrics
-        return this.responseCache.size > 0 ? 0.3 : 0; // Placeholder
+        return this.responseCache.size > 0 ? 0.3 : 0;
     }
 
-    // Clear cache manually
     clearCache() {
         this.responseCache.clear();
         console.log('Response cache cleared');
-    }
-
-    buildConversationContext(recentMessages = []) {
-        if (!recentMessages || recentMessages.length === 0) {
-            return '';
-        }
-
-        const contextMessages = recentMessages
-            .slice(-3) // Reduced from 5 to 3 to save tokens
-            .map(msg => `${msg.sender === 'user' ? 'User' : 'Assistant'}: ${msg.content}`)
-            .join('\n');
-
-        return `Previous conversation:\n${contextMessages}\n\n`;
     }
 
     async testConnection() {
