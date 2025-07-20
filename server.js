@@ -26,6 +26,7 @@ app.use('/api/auth', require('./src/routes/authRoutes'));
 app.use('/api/users', require('./src/routes/userRoutes'));
 app.use('/api/projects', require('./src/routes/projectRoutes'));
 app.use('/api/subtasks', require('./src/routes/subtaskRoutes'));
+app.use('/api/chats', require('./src/routes/chatRoutes'));
 
 // Error handling middleware
 app.use((err, req, res, next) => {
