@@ -227,73 +227,143 @@ Please provide a helpful, conversational response. If the user is describing a p
         }
     }
 
-    // Extract project information from conversation context
-    async extractProjectFromConversation(messages = []) {
+    // OPTIMIZED: Simple rule-based project extraction (NO API CALL)
+    extractProjectFromConversation(messages = []) {
         try {
             if (!messages || messages.length === 0) {
+                console.log('No messages provided for project extraction');
                 return null;
             }
 
-            // Build conversation context
-            const conversationText = messages
-                .slice(-10) // Get last 10 messages
-                .map(msg => `${msg.sender === 'user' ? 'User' : 'Assistant'}: ${msg.content}`)
-                .join('\n');
+            // Get recent user messages
+            const userMessages = messages
+                .filter(msg => msg.sender === 'user')
+                .slice(-3) // Get last 3 user messages
+                .map(msg => msg.content.toLowerCase());
 
-            const extractionPrompt = `Analyze this conversation to extract project information. Look for any mention of:
-- Goals, objectives, or things the user wants to accomplish
-- Work that needs to be organized or planned  
-- Problems that need systematic solutions
-- Any project-like activities
+            if (userMessages.length === 0) {
+                console.log('No user messages found');
+                return null;
+            }
 
-Conversation:
-${conversationText}
+            // Simple keyword-based project detection
+            const projectKeywords = [
+                'project', 'build', 'create', 'develop', 'make', 'design',
+                'plan', 'organize', 'goal', 'task', 'website', 'app',
+                'application', 'system', 'dashboard', 'platform',
+                'launch', 'start', 'begin', 'implement', 'work on'
+            ];
 
-If you can identify a potential project, extract the key information. Use intelligent defaults for missing information.
-Today's date is: ${new Date().toISOString().split('T')[0]}
+            const complexityKeywords = {
+                high: ['complex', 'advanced', 'sophisticated', 'enterprise', 'large', 'comprehensive'],
+                medium: ['moderate', 'standard', 'typical', 'regular'],
+                low: ['simple', 'basic', 'quick', 'small', 'minimal']
+            };
 
-Respond with JSON only. If no clear project can be identified, return {"hasProject": false}.
-If a project can be identified, return:
-{
-  "hasProject": true,
-  "title": "clear project title based on conversation",
-  "description": "detailed project description synthesized from conversation", 
-  "timeline": estimated_days_number,
-  "startDate": "${new Date().toISOString().split('T')[0]}",
-  "dueDate": "YYYY-MM-DD",
-  "priority": "High|Medium|Low",
-  "category": "Development|Marketing|Research|Planning|Personal|Business|Other",
-  "tags": ["relevant", "tags", "from", "conversation"],
-  "estimatedComplexity": "Low|Medium|High"
-}`;
+            const categoryKeywords = {
+                'Development': ['website', 'app', 'application', 'code', 'software', 'system', 'platform', 'api'],
+                'Marketing': ['marketing', 'campaign', 'promotion', 'brand', 'social media', 'content'],
+                'Research': ['research', 'study', 'analysis', 'investigate', 'explore'],
+                'Planning': ['plan', 'strategy', 'roadmap', 'schedule', 'organize'],
+                'Business': ['business', 'startup', 'company', 'revenue', 'sales', 'client'],
+                'Personal': ['personal', 'hobby', 'learning', 'skill', 'improvement']
+            };
 
-            console.log('Extracting project from conversation...');
-            const result = await this.model.generateContent(extractionPrompt);
-            const response = result.response.text().trim();
-            
-            // Try to find JSON in the response
-            const jsonMatch = response.match(/\{[\s\S]*?\}(?=\s*$|\s*\n\s*$)/);
-            
-            if (jsonMatch) {
-                const projectData = JSON.parse(jsonMatch[0]);
-                this.incrementUserCount('system');
-                
-                if (projectData.hasProject) {
-                    // Calculate due date if not provided
-                    if (!projectData.dueDate && projectData.timeline) {
-                        const dueDate = new Date();
-                        dueDate.setDate(dueDate.getDate() + projectData.timeline);
-                        projectData.dueDate = dueDate.toISOString().split('T')[0];
-                    }
-                    
-                    return projectData;
+            // Check if any message contains project keywords
+            const hasProjectKeywords = userMessages.some(msg =>
+                projectKeywords.some(keyword => msg.includes(keyword))
+            );
+
+            if (!hasProjectKeywords) {
+                console.log('No project keywords found in messages');
+                return null;
+            }
+
+            // Extract information from the most recent message
+            const latestMessage = messages.filter(msg => msg.sender === 'user').slice(-1)[0];
+            const messageContent = latestMessage.content;
+
+            // Generate basic project data without API call
+            const today = new Date();
+            const dueDate = new Date();
+            dueDate.setDate(today.getDate() + 30); // Default 30 days
+
+            // Determine category based on keywords
+            let category = 'Other';
+            for (const [cat, keywords] of Object.entries(categoryKeywords)) {
+                if (keywords.some(keyword => messageContent.toLowerCase().includes(keyword))) {
+                    category = cat;
+                    break;
                 }
             }
+
+            // Determine complexity
+            let complexity = 'Medium';
+            for (const [level, keywords] of Object.entries(complexityKeywords)) {
+                if (keywords.some(keyword => messageContent.toLowerCase().includes(keyword))) {
+                    complexity = level.charAt(0).toUpperCase() + level.slice(1);
+                    break;
+                }
+            }
+
+            // Generate title from message (first 50 chars, cleaned up)
+            let title = messageContent.replace(/[^\w\s]/g, '').substring(0, 50).trim();
+            if (!title) {
+                title = 'New Project';
+            } else if (title.length < 10) {
+                title = `${title} Project`;
+            }
+
+            // Estimate timeline based on complexity
+            const timelineMap = { 'Low': 14, 'Medium': 30, 'High': 60 };
+            const timeline = timelineMap[complexity] || 30;
+
+            dueDate.setDate(today.getDate() + timeline);
+
+            const projectData = {
+                hasProject: true,
+                title: title,
+                description: messageContent.substring(0, 200), // First 200 chars as description
+                timeline: timeline,
+                startDate: today.toISOString().split('T')[0],
+                dueDate: dueDate.toISOString().split('T')[0],
+                priority: complexity === 'High' ? 'High' : complexity === 'Low' ? 'Low' : 'Medium',
+                category: category,
+                tags: this.extractTagsFromMessage(messageContent),
+                estimatedComplexity: complexity
+            };
+
+            console.log('Project extracted without API call:', projectData.title);
+            return projectData;
+
         } catch (error) {
             console.error('Error extracting project from conversation:', error);
+            return null;
         }
-        
-        return null;
+    }
+
+    // Helper method to extract tags from message content
+    extractTagsFromMessage(content) {
+        const commonTags = {
+            'web': ['website', 'web', 'html', 'css', 'javascript'],
+            'mobile': ['mobile', 'app', 'android', 'ios', 'react native'],
+            'backend': ['api', 'server', 'database', 'backend'],
+            'frontend': ['frontend', 'ui', 'ux', 'design'],
+            'ecommerce': ['shop', 'store', 'ecommerce', 'payment'],
+            'automation': ['automate', 'script', 'workflow'],
+            'learning': ['learn', 'study', 'course', 'tutorial']
+        };
+
+        const tags = [];
+        const lowerContent = content.toLowerCase();
+
+        for (const [tag, keywords] of Object.entries(commonTags)) {
+            if (keywords.some(keyword => lowerContent.includes(keyword))) {
+                tags.push(tag);
+            }
+        }
+
+        return tags.slice(0, 5); // Limit to 5 tags
     }
 
     // Generate project tasks with better error handling
@@ -350,16 +420,22 @@ CRITICAL: Respond with valid JSON only. No markdown, no extra text, no comments.
 }`;
 
         try {
+            // Check if we have enough quota for task generation
+            if (this.dailyRequestCount >= this.MAX_DAILY_REQUESTS) {
+                console.log('API quota exhausted, using fallback tasks');
+                return this.generateFallbackTasks(projectData);
+            }
+
             console.log('Generating project tasks...');
             const result = await this.model.generateContent(prompt);
             let response = result.response.text().trim();
-            
+
             // Clean up the response - remove markdown formatting
             response = response.replace(/```json\s*/g, '').replace(/```\s*/g, '');
-            
+
             // Find JSON in the response
             const jsonMatch = response.match(/\{[\s\S]*\}$/);
-            
+
             if (jsonMatch) {
                 const tasksResponse = JSON.parse(jsonMatch[0]);
                 this.incrementUserCount('system');
@@ -419,7 +495,7 @@ CRITICAL: Respond with valid JSON only. No markdown, no extra text, no comments.
             throw new Error('No valid JSON found in response');
         } catch (error) {
             console.error('Error generating project tasks:', error);
-            
+
             // Return fallback tasks
             return this.generateFallbackTasks(projectData);
         }
@@ -508,101 +584,6 @@ CRITICAL: Respond with valid JSON only. No markdown, no extra text, no comments.
         };
     }
 
-    // Batch processing for multiple requests
-    async batchProcessRequests(requests) {
-        const results = [];
-        const apiRequests = [];
-
-        // First pass: Check cache and common responses
-        for (let i = 0; i < requests.length; i++) {
-            const { userMessage, context } = requests[i];
-
-            // Check common responses
-            const commonResponse = this.checkCommonResponses(userMessage);
-            if (commonResponse) {
-                results[i] = commonResponse;
-                continue;
-            }
-
-            // Check cache
-            const cacheKey = this.generateCacheKey(userMessage, context);
-            const cachedResponse = this.getCachedResponse(cacheKey);
-            if (cachedResponse) {
-                results[i] = cachedResponse;
-                continue;
-            }
-
-            // Queue for API call
-            apiRequests.push({ index: i, userMessage, context, cacheKey });
-        }
-
-        // Second pass: Process remaining requests with API calls
-        const remainingQuota = this.MAX_DAILY_REQUESTS - this.dailyRequestCount;
-        const requestsToProcess = Math.min(apiRequests.length, remainingQuota);
-
-        for (let i = 0; i < requestsToProcess; i++) {
-            const { index, userMessage, context, cacheKey } = apiRequests[i];
-            try {
-                const response = await this.generateChatResponse(userMessage, context);
-                results[index] = response;
-            } catch (error) {
-                results[index] = {
-                    message: "Error processing this request in batch.",
-                    type: 'batch_error',
-                    cached: true
-                };
-            }
-        }
-
-        // Handle remaining requests that couldn't be processed due to quota
-        for (let i = requestsToProcess; i < apiRequests.length; i++) {
-            const { index } = apiRequests[i];
-            results[index] = {
-                message: "Request queued due to daily quota limits. Please try again tomorrow.",
-                type: 'quota_limited',
-                cached: true
-            };
-        }
-
-        return results;
-    }
-
-    // Enhanced chat response with project detection (optimized)
-    async generateEnhancedChatResponse(userMessage, context = {}) {
-        try {
-            // First try regular optimized response
-            const chatResponse = await this.generateChatResponse(userMessage, context);
-
-            // Only do project analysis if we got a real API response (not cached/common)
-            if (chatResponse.type === 'api_response' && this.dailyRequestCount < this.MAX_DAILY_REQUESTS - 2) {
-                // We need at least 2 API calls remaining for project analysis + task generation
-                const projectAnalysis = await this.analyzeForProjectCreation(userMessage);
-
-                if (projectAnalysis.isProjectRequest && projectAnalysis.confidence > 0.7) {
-                    const projectData = await this.extractProjectData(userMessage);
-                    const subtasks = await this.generateProjectTasks(projectData);
-
-                    return {
-                        message: this.formatProjectCreationResponse(projectData, subtasks),
-                        type: 'project_creation',
-                        projectData,
-                        subtasks: subtasks.subtasks,
-                        metadata: {
-                            totalTasks: subtasks.subtasks?.length || 0,
-                            estimatedHours: subtasks.totalEstimatedHours || 0
-                        }
-                    };
-                }
-            }
-
-            return chatResponse;
-
-        } catch (error) {
-            console.error('Error in generateEnhancedChatResponse:', error);
-            return await this.generateChatResponse(userMessage, context);
-        }
-    }
-
     // Get usage statistics
     getUsageStats() {
         this.checkDailyReset();
@@ -626,124 +607,6 @@ CRITICAL: Respond with valid JSON only. No markdown, no extra text, no comments.
     clearCache() {
         this.responseCache.clear();
         console.log('Response cache cleared');
-    }
-
-    // The rest of your existing methods with minimal changes...
-    async analyzeForProjectCreation(message) {
-        // Only call if we have quota remaining
-        if (this.dailyRequestCount >= this.MAX_DAILY_REQUESTS) {
-            return { isProjectRequest: false, confidence: 0, reasoning: "Quota exhausted" };
-        }
-
-        const analysisPrompt = `
-Analyze this message to determine if the user wants to create a project or accomplish a goal that could be organized as a project:
-
-Message: "${message}"
-
-Look for indicators like:
-- Describing a goal or objective they want to achieve
-- Mentioning work that needs to be organized or planned
-- Asking for help with planning or structuring something
-- Describing a problem that needs a systematic approach
-- Using words related to projects, planning, goals, tasks, etc.
-
-IMPORTANT: Cooking recipes, general questions, or requests for information are NOT project requests.
-
-Respond with JSON only:
-{
-  "isProjectRequest": true/false,
-  "confidence": 0.1-1.0,
-  "reasoning": "brief explanation"
-}`;
-
-        try {
-            const result = await this.model.generateContent(analysisPrompt);
-            const response = result.response.text();
-            const jsonMatch = response.match(/\{[\s\S]*?\}/);
-
-            if (jsonMatch) {
-                const analysis = JSON.parse(jsonMatch[0]);
-                this.incrementUserCount('system'); // Count this API call
-                return analysis;
-            }
-        } catch (error) {
-            console.error('Error analyzing project creation:', error);
-        }
-
-        return { isProjectRequest: false, confidence: 0, reasoning: "Analysis failed" };
-    }
-
-    async extractProjectData(message) {
-        const today = new Date();
-        const dueDate = new Date(today.getTime() + (30 * 24 * 60 * 60 * 1000));
-
-        const extractionPrompt = `
-Based on this user message, extract project information and provide smart defaults:
-
-User message: "${message}"
-
-Create a comprehensive project structure. If specific information is not provided, use intelligent defaults.
-Today's date is: ${today.toISOString().split('T')[0]}
-
-Respond with JSON only:
-{
-  "title": "clear project title",
-  "description": "detailed project description", 
-  "timeline": number_of_days,
-  "startDate": "${today.toISOString().split('T')[0]}",
-  "dueDate": "${dueDate.toISOString().split('T')[0]}",
-  "dueTime": "17:00",
-  "priority": "High|Medium|Low",
-  "category": "Development|Marketing|Research|Planning|Personal|Business|Other",
-  "tags": ["relevant", "tags"],
-  "estimatedComplexity": "Low|Medium|High"
-}`;
-
-        try {
-            const result = await this.model.generateContent(extractionPrompt);
-            const response = result.response.text();
-            const jsonMatch = response.match(/\{[\s\S]*?\}/);
-
-            if (jsonMatch) {
-                this.incrementUserCount('system');
-                return JSON.parse(jsonMatch[0]);
-            }
-        } catch (error) {
-            console.error('Error extracting project data:', error);
-        }
-
-        return {
-            title: "New Project",
-            description: "Project description to be refined",
-            timeline: 30,
-            startDate: today.toISOString().split('T')[0],
-            dueDate: dueDate.toISOString().split('T')[0],
-            dueTime: "17:00",
-            priority: "Medium",
-            category: "General",
-            tags: [],
-            estimatedComplexity: "Medium"
-        };
-    }
-
-    formatProjectCreationResponse(projectData, subtasksResponse) {
-        const taskCount = subtasksResponse.subtasks?.length || 0;
-        const hours = subtasksResponse.totalEstimatedHours || 0;
-
-        return `Great! I've analyzed your request and created a project plan for "${projectData.title}".
-
-📋 **Project Overview:**
-• **Timeline:** ${projectData.timeline} days
-• **Priority:** ${projectData.priority}
-• **Category:** ${projectData.category}
-
-📝 **Generated Tasks:** ${taskCount} tasks
-⏱️ **Estimated Time:** ${hours} hours
-
-${taskCount > 0 ? '**Tasks include:**\n' + subtasksResponse.subtasks.slice(0, 3).map((task, i) => `${i + 1}. ${task.title}`).join('\n') : ''}
-${taskCount > 3 ? `... and ${taskCount - 3} more tasks` : ''}
-
-Would you like me to create this project for you? Click the "Create Project" button to add it to your dashboard with all the tasks ready to go!`;
     }
 
     buildConversationContext(recentMessages = []) {
