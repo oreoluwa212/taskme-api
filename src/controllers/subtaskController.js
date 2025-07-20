@@ -40,16 +40,13 @@ const generateSubtasks = asyncHandler(async (req, res) => {
     try {
         let aiResponse;
 
-        // Try to use the correct method based on your aiService structure
-        if (aiService.aiChatService && typeof aiService.aiChatService.generateProjectTasks === 'function') {
-            // If aiService exports { aiChatService, aiProjectService }
-            aiResponse = await aiService.aiChatService.generateProjectTasks(projectData);
-        } else if (aiService.generateProjectTasks && typeof aiService.generateProjectTasks === 'function') {
-            // If aiService directly exports the method
+        // Fixed: Use the correct method from the aiService structure
+        if (typeof aiService.generateProjectTasks === 'function') {
+            // Direct method call (based on your module.exports)
             aiResponse = await aiService.generateProjectTasks(projectData);
-        } else if (aiService.aiProjectService && typeof aiService.aiProjectService.generateProjectTasks === 'function') {
-            // If there's an aiProjectService
-            aiResponse = await aiService.aiProjectService.generateProjectTasks(projectData);
+        } else if (aiService.aiChatService && typeof aiService.aiChatService.generateProjectTasks === 'function') {
+            // If aiChatService is available
+            aiResponse = await aiService.aiChatService.generateProjectTasks(projectData);
         } else {
             // If none of the above work, throw an error to trigger fallback
             throw new Error('generateProjectTasks method not found in aiService');
@@ -104,11 +101,11 @@ const generateSubtasks = asyncHandler(async (req, res) => {
     } catch (error) {
         console.error('AI subtask generation error:', error);
 
-        // Fallback to simple subtask generation
+        // Enhanced fallback to simple subtask generation with better error handling
         const fallbackSubtasks = [
             {
                 title: 'Project Planning and Setup',
-                description: 'Define project scope, requirements, and set up initial structure',
+                description: `Define project scope for "${project.title}" and set up initial structure`,
                 order: 1,
                 priority: 'High',
                 estimatedHours: 4,
@@ -116,7 +113,7 @@ const generateSubtasks = asyncHandler(async (req, res) => {
             },
             {
                 title: 'Research and Analysis',
-                description: 'Conduct necessary research and analyze requirements',
+                description: 'Conduct necessary research and analyze requirements for the project',
                 order: 2,
                 priority: 'High',
                 estimatedHours: 6,
@@ -132,7 +129,7 @@ const generateSubtasks = asyncHandler(async (req, res) => {
             },
             {
                 title: 'Core Implementation',
-                description: 'Implement the main features and functionality',
+                description: `Implement the main features and functionality for ${project.title}`,
                 order: 4,
                 priority: 'High',
                 estimatedHours: 16,
@@ -156,29 +153,41 @@ const generateSubtasks = asyncHandler(async (req, res) => {
             }
         ];
 
-        const subtasks = await Subtask.insertMany(
-            fallbackSubtasks.map(task => ({
-                ...task,
-                projectId,
-                userId: req.user.id,
-                status: 'Pending',
-                aiGenerated: false,
-                complexity: 'Medium',
-                riskLevel: 'Low',
-                tags: [],
-                skills: []
-            }))
-        );
+        try {
+            const subtasks = await Subtask.insertMany(
+                fallbackSubtasks.map(task => ({
+                    ...task,
+                    projectId,
+                    userId: req.user.id,
+                    status: 'Pending',
+                    aiGenerated: false,
+                    complexity: 'Medium',
+                    riskLevel: 'Low',
+                    tags: [],
+                    skills: [],
+                    startDate: project.startDate || new Date().toISOString().split('T')[0],
+                    dueDate: project.dueDate || new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0]
+                }))
+            );
 
-        // Update project progress and status after generating fallback subtasks
-        await updateProjectProgressAndStatus(projectId);
+            // Update project progress and status after generating fallback subtasks
+            await updateProjectProgressAndStatus(projectId);
 
-        res.status(201).json({
-            success: true,
-            data: subtasks,
-            fallbackUsed: true,
-            message: 'Subtasks generated using fallback method due to AI service error'
-        });
+            res.status(201).json({
+                success: true,
+                data: subtasks,
+                fallbackUsed: true,
+                message: 'Subtasks generated using fallback method due to AI service error',
+                error: error.message
+            });
+        } catch (fallbackError) {
+            console.error('Fallback subtask generation error:', fallbackError);
+            res.status(500).json({
+                success: false,
+                message: 'Failed to generate subtasks with both AI and fallback methods',
+                error: fallbackError.message
+            });
+        }
     }
 });
 

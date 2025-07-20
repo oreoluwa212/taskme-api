@@ -227,6 +227,287 @@ Please provide a helpful, conversational response. If the user is describing a p
         }
     }
 
+    // Extract project information from conversation context
+    async extractProjectFromConversation(messages = []) {
+        try {
+            if (!messages || messages.length === 0) {
+                return null;
+            }
+
+            // Build conversation context
+            const conversationText = messages
+                .slice(-10) // Get last 10 messages
+                .map(msg => `${msg.sender === 'user' ? 'User' : 'Assistant'}: ${msg.content}`)
+                .join('\n');
+
+            const extractionPrompt = `Analyze this conversation to extract project information. Look for any mention of:
+- Goals, objectives, or things the user wants to accomplish
+- Work that needs to be organized or planned  
+- Problems that need systematic solutions
+- Any project-like activities
+
+Conversation:
+${conversationText}
+
+If you can identify a potential project, extract the key information. Use intelligent defaults for missing information.
+Today's date is: ${new Date().toISOString().split('T')[0]}
+
+Respond with JSON only. If no clear project can be identified, return {"hasProject": false}.
+If a project can be identified, return:
+{
+  "hasProject": true,
+  "title": "clear project title based on conversation",
+  "description": "detailed project description synthesized from conversation", 
+  "timeline": estimated_days_number,
+  "startDate": "${new Date().toISOString().split('T')[0]}",
+  "dueDate": "YYYY-MM-DD",
+  "priority": "High|Medium|Low",
+  "category": "Development|Marketing|Research|Planning|Personal|Business|Other",
+  "tags": ["relevant", "tags", "from", "conversation"],
+  "estimatedComplexity": "Low|Medium|High"
+}`;
+
+            console.log('Extracting project from conversation...');
+            const result = await this.model.generateContent(extractionPrompt);
+            const response = result.response.text().trim();
+            
+            // Try to find JSON in the response
+            const jsonMatch = response.match(/\{[\s\S]*?\}(?=\s*$|\s*\n\s*$)/);
+            
+            if (jsonMatch) {
+                const projectData = JSON.parse(jsonMatch[0]);
+                this.incrementUserCount('system');
+                
+                if (projectData.hasProject) {
+                    // Calculate due date if not provided
+                    if (!projectData.dueDate && projectData.timeline) {
+                        const dueDate = new Date();
+                        dueDate.setDate(dueDate.getDate() + projectData.timeline);
+                        projectData.dueDate = dueDate.toISOString().split('T')[0];
+                    }
+                    
+                    return projectData;
+                }
+            }
+        } catch (error) {
+            console.error('Error extracting project from conversation:', error);
+        }
+        
+        return null;
+    }
+
+    // Generate project tasks with better error handling
+    async generateProjectTasks(projectData) {
+        const today = new Date().toISOString().split('T')[0];
+        const startDate = projectData.startDate || today;
+        const endDate = projectData.dueDate || (() => {
+            const date = new Date();
+            date.setDate(date.getDate() + (projectData.timeline || 30));
+            return date.toISOString().split('T')[0];
+        })();
+
+        const prompt = `Create a detailed task breakdown for this project. Be very careful with JSON formatting.
+
+Project: ${projectData.title || projectData.name || 'Untitled Project'}
+Description: ${projectData.description || 'No description provided'}
+Timeline: ${projectData.timeline || 30} days
+Priority: ${projectData.priority || 'Medium'}
+Category: ${projectData.category || 'General'}
+Start Date: ${startDate}
+End Date: ${endDate}
+
+Generate 4-8 specific, actionable subtasks. Each task should be concrete and completable.
+
+CRITICAL: Respond with valid JSON only. No markdown, no extra text, no comments.
+
+{
+  "subtasks": [
+    {
+      "title": "Task title under 60 characters",
+      "description": "Clear description of what needs to be done",
+      "estimatedHours": 3,
+      "priority": "High",
+      "order": 1,
+      "phase": "Planning",
+      "complexity": "Medium",
+      "riskLevel": "Low",
+      "tags": [],
+      "skills": [],
+      "startDate": "${startDate}",
+      "dueDate": "${endDate}"
+    }
+  ],
+  "totalEstimatedHours": 24,
+  "criticalPath": ["Task 1", "Task 2"],
+  "milestones": ["Mid-project review", "Final delivery"],
+  "riskFactors": ["Resource availability"],
+  "suggestions": ["Regular progress reviews"],
+  "resources": ["Documentation", "Tools"],
+  "projectInsights": "Key insights about the project",
+  "recommendedTeamSize": 2,
+  "estimatedBudget": "Medium",
+  "successMetrics": ["Quality metrics", "Timeline adherence"]
+}`;
+
+        try {
+            console.log('Generating project tasks...');
+            const result = await this.model.generateContent(prompt);
+            let response = result.response.text().trim();
+            
+            // Clean up the response - remove markdown formatting
+            response = response.replace(/```json\s*/g, '').replace(/```\s*/g, '');
+            
+            // Find JSON in the response
+            const jsonMatch = response.match(/\{[\s\S]*\}$/);
+            
+            if (jsonMatch) {
+                const tasksResponse = JSON.parse(jsonMatch[0]);
+                this.incrementUserCount('system');
+
+                // Validate and fix the response structure
+                if (!tasksResponse.subtasks || !Array.isArray(tasksResponse.subtasks)) {
+                    throw new Error('Invalid subtasks structure');
+                }
+
+                // Ensure required fields and calculate dates
+                const projectStart = new Date(startDate);
+                const projectEnd = new Date(endDate);
+                const totalDays = Math.max(1, Math.ceil((projectEnd - projectStart) / (1000 * 60 * 60 * 24)));
+
+                tasksResponse.subtasks = tasksResponse.subtasks.map((task, index) => {
+                    // Calculate task dates
+                    const taskStartOffset = Math.floor((index / tasksResponse.subtasks.length) * totalDays);
+                    const taskDuration = Math.ceil((task.estimatedHours || 4) / 8) || 1;
+
+                    const taskStart = new Date(projectStart);
+                    taskStart.setDate(taskStart.getDate() + taskStartOffset);
+
+                    const taskEnd = new Date(taskStart);
+                    taskEnd.setDate(taskEnd.getDate() + taskDuration);
+
+                    return {
+                        title: task.title || `Task ${index + 1}`,
+                        description: task.description || 'Task description',
+                        estimatedHours: task.estimatedHours || 4,
+                        priority: task.priority || 'Medium',
+                        order: index + 1,
+                        phase: task.phase || 'Execution',
+                        complexity: task.complexity || 'Medium',
+                        riskLevel: task.riskLevel || 'Low',
+                        tags: task.tags || [],
+                        skills: task.skills || [],
+                        startDate: taskStart.toISOString().split('T')[0],
+                        dueDate: taskEnd.toISOString().split('T')[0]
+                    };
+                });
+
+                // Ensure other fields have defaults
+                tasksResponse.totalEstimatedHours = tasksResponse.subtasks.reduce((sum, task) => sum + (task.estimatedHours || 0), 0);
+                tasksResponse.criticalPath = tasksResponse.criticalPath || [];
+                tasksResponse.milestones = tasksResponse.milestones || [];
+                tasksResponse.riskFactors = tasksResponse.riskFactors || [];
+                tasksResponse.suggestions = tasksResponse.suggestions || [];
+                tasksResponse.resources = tasksResponse.resources || [];
+                tasksResponse.projectInsights = tasksResponse.projectInsights || 'Project ready for execution';
+                tasksResponse.recommendedTeamSize = tasksResponse.recommendedTeamSize || 1;
+                tasksResponse.estimatedBudget = tasksResponse.estimatedBudget || 'Medium';
+                tasksResponse.successMetrics = tasksResponse.successMetrics || [];
+
+                return tasksResponse;
+            }
+
+            throw new Error('No valid JSON found in response');
+        } catch (error) {
+            console.error('Error generating project tasks:', error);
+            
+            // Return fallback tasks
+            return this.generateFallbackTasks(projectData);
+        }
+    }
+
+    // Generate fallback tasks when AI fails
+    generateFallbackTasks(projectData) {
+        const today = new Date().toISOString().split('T')[0];
+        const dueDate = projectData.dueDate || (() => {
+            const date = new Date();
+            date.setDate(date.getDate() + (projectData.timeline || 30));
+            return date.toISOString().split('T')[0];
+        })();
+
+        const fallbackTasks = [
+            {
+                title: 'Project Planning and Setup',
+                description: 'Define project scope, requirements, and set up initial structure',
+                estimatedHours: 4,
+                priority: 'High',
+                order: 1,
+                phase: 'Planning',
+                complexity: 'Medium',
+                riskLevel: 'Low',
+                tags: [],
+                skills: [],
+                startDate: today,
+                dueDate: dueDate
+            },
+            {
+                title: 'Research and Analysis',
+                description: 'Conduct necessary research and analyze requirements',
+                estimatedHours: 6,
+                priority: 'High',
+                order: 2,
+                phase: 'Planning',
+                complexity: 'Medium',
+                riskLevel: 'Low',
+                tags: [],
+                skills: [],
+                startDate: today,
+                dueDate: dueDate
+            },
+            {
+                title: 'Core Implementation',
+                description: 'Implement the main features and functionality',
+                estimatedHours: 12,
+                priority: 'High',
+                order: 3,
+                phase: 'Execution',
+                complexity: 'High',
+                riskLevel: 'Medium',
+                tags: [],
+                skills: [],
+                startDate: today,
+                dueDate: dueDate
+            },
+            {
+                title: 'Testing and Quality Assurance',
+                description: 'Test all components and ensure quality standards',
+                estimatedHours: 6,
+                priority: 'Medium',
+                order: 4,
+                phase: 'Review',
+                complexity: 'Medium',
+                riskLevel: 'Low',
+                tags: [],
+                skills: [],
+                startDate: today,
+                dueDate: dueDate
+            }
+        ];
+
+        return {
+            subtasks: fallbackTasks,
+            totalEstimatedHours: 28,
+            criticalPath: ['Project Planning and Setup', 'Core Implementation'],
+            milestones: ['Planning Complete', 'Implementation Done'],
+            riskFactors: ['Resource availability', 'Timeline constraints'],
+            suggestions: ['Regular progress reviews', 'Early testing'],
+            resources: ['Documentation', 'Development tools'],
+            projectInsights: 'Standard project structure applied',
+            recommendedTeamSize: 2,
+            estimatedBudget: 'Medium',
+            successMetrics: ['On-time delivery', 'Quality standards met']
+        };
+    }
+
     // Batch processing for multiple requests
     async batchProcessRequests(requests) {
         const results = [];
@@ -442,79 +723,6 @@ Respond with JSON only:
             category: "General",
             tags: [],
             estimatedComplexity: "Medium"
-        };
-    }
-
-    async generateProjectTasks(projectData) {
-        const prompt = `
-Create a detailed task breakdown for this project:
-
-Project: ${projectData.title}
-Description: ${projectData.description}
-Timeline: ${projectData.timeline} days
-Priority: ${projectData.priority}
-Category: ${projectData.category}
-
-Generate 5-12 specific, actionable subtasks. Each task should be something concrete that can be completed.
-
-Respond with JSON only:
-{
-  "subtasks": [
-    {
-      "title": "Clear, actionable task title (max 80 chars)",
-      "description": "Detailed description with specific deliverables",
-      "estimatedHours": 2.5,
-      "priority": "High|Medium|Low",
-      "order": 1,
-      "phase": "Planning|Execution|Review|QA",
-      "complexity": "Low|Medium|High",
-      "startDate": "YYYY-MM-DD",
-      "dueDate": "YYYY-MM-DD"
-    }
-  ],
-  "totalEstimatedHours": 25.5
-}`;
-
-        try {
-            const result = await this.model.generateContent(prompt);
-            const response = result.response.text();
-            const jsonMatch = response.match(/\{[\s\S]*?\}/);
-
-            if (jsonMatch) {
-                const tasksResponse = JSON.parse(jsonMatch[0]);
-                this.incrementUserCount('system');
-
-                const projectStart = new Date(projectData.startDate);
-                const projectEnd = new Date(projectData.dueDate);
-                const totalDays = Math.ceil((projectEnd - projectStart) / (1000 * 60 * 60 * 24));
-
-                tasksResponse.subtasks = tasksResponse.subtasks.map((task, index) => {
-                    if (!task.startDate || !task.dueDate) {
-                        const taskStartOffset = Math.floor((index / tasksResponse.subtasks.length) * totalDays);
-                        const taskDuration = Math.ceil(task.estimatedHours / 8) || 1;
-
-                        const taskStart = new Date(projectStart);
-                        taskStart.setDate(taskStart.getDate() + taskStartOffset);
-
-                        const taskEnd = new Date(taskStart);
-                        taskEnd.setDate(taskEnd.getDate() + taskDuration);
-
-                        task.startDate = taskStart.toISOString().split('T')[0];
-                        task.dueDate = taskEnd.toISOString().split('T')[0];
-                    }
-
-                    return task;
-                });
-
-                return tasksResponse;
-            }
-        } catch (error) {
-            console.error('Error generating project tasks:', error);
-        }
-
-        return {
-            subtasks: [],
-            totalEstimatedHours: 0
         };
     }
 
