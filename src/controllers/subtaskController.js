@@ -713,6 +713,11 @@ const getSubtaskStats = async (req, res) => {
         const userId = req.user.id;
         const skip = (parseInt(page) - 1) * parseInt(limit);
 
+        // Define date ranges for productivity insights
+        const now = new Date();
+        const lastWeek = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+        const lastMonth = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+
         // Build base query
         let query = { userId: new mongoose.Types.ObjectId(userId) };
 
@@ -892,6 +897,7 @@ const getSubtaskStats = async (req, res) => {
             { $limit: 10 }
         ]);
 
+        // Get productivity insights - FIXED: Now using defined variables
         const productivityInsights = {
             thisWeek: await Subtask.countDocuments({
                 userId: new mongoose.Types.ObjectId(userId),
