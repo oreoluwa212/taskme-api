@@ -568,7 +568,18 @@ const createProjectFromChat = asyncHandler(async (req, res) => {
                 message: 'The AI service is currently overloaded. Please try again in a few minutes.'
             });
         }
-
+        if (error.status === 429) {
+            await Message.create({
+                chatId,
+                content: "You have reached the daily limit for AI requests. Please try again tomorrow or upgrade your plan.",
+                sender: 'assistant',
+                userId: null
+            });
+            return res.status(429).json({
+                success: false,
+                message: 'You have reached the daily limit for AI requests. Please try again tomorrow or upgrade your plan.'
+            });
+        }
         console.error('Project creation from chat error:', error);
 
         await Message.create({
