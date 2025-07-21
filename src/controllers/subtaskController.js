@@ -14,19 +14,38 @@ const generateBasicTasksFromExtraction = async (extractedProject, projectData) =
     const basicPhases = ['Planning', 'Execution', 'Review'];
     const tasksPerPhase = Math.ceil(6 / basicPhases.length);
 
+    // Date handling - ensure proper format
+    const today = new Date();
+    const todayStr = today.toISOString().split('T')[0]; // YYYY-MM-DD format
+
+    // Validate project start and due dates
+    const projectStartDate = projectData.startDate && new Date(projectData.startDate) >= today
+        ? projectData.startDate
+        : todayStr;
+
+    const projectDueDate = projectData.dueDate && new Date(projectData.dueDate) > new Date(projectStartDate)
+        ? projectData.dueDate
+        : new Date(Date.now() + (projectData.timeline || 30) * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+
     const subtasks = [];
     let order = 1;
 
     basicPhases.forEach((phase, phaseIndex) => {
         for (let i = 0; i < tasksPerPhase && subtasks.length < 6; i++) {
+            // Calculate task dates within project timeline
+            const taskStartDate = phaseIndex === 0 ? projectStartDate : projectStartDate;
+            const taskDueDate = phaseIndex === basicPhases.length - 1 ? projectDueDate : projectDueDate;
+
             subtasks.push({
                 title: `${phase} Task ${i + 1} for ${projectData.name}`,
                 description: `${phase} activities for ${projectData.description?.substring(0, 100)}...`,
                 order: order++,
                 priority: phaseIndex === 0 ? 'High' : 'Medium',
-                estimatedHours: Math.max(0.5, Math.ceil(projectData.timeline / 6)),
+                estimatedHours: Math.max(0.5, Math.ceil((projectData.timeline || 30) / 6)),
                 phase: phase,
-                complexity: extractedProject.estimatedComplexity || 'Medium'
+                complexity: extractedProject.estimatedComplexity || 'Medium',
+                startDate: taskStartDate,
+                dueDate: taskDueDate
             });
         }
     });
@@ -39,7 +58,6 @@ const generateBasicTasksFromExtraction = async (extractedProject, projectData) =
     };
 };
 
-// Create a new subtask
 const createSubtask = async (req, res) => {
     try {
         const { projectId, title, description, order, priority, estimatedHours, phase, complexity, riskLevel, tags, skills, startDate, dueDate, dependencies } = req.body;
@@ -52,6 +70,19 @@ const createSubtask = async (req, res) => {
         if (!project) {
             return res.status(404).json({ success: false, message: 'Project not found or unauthorized' });
         }
+
+        // Date validation for subtask
+        const today = new Date();
+        const todayStr = today.toISOString().split('T')[0];
+
+        // Validate subtask dates against project dates
+        const validStartDate = startDate && new Date(startDate) >= today
+            ? startDate
+            : (project.startDate || todayStr);
+
+        const validDueDate = dueDate && new Date(dueDate) > new Date(validStartDate) && new Date(dueDate) <= new Date(project.dueDate)
+            ? dueDate
+            : project.dueDate;
 
         const subtask = await Subtask.create({
             projectId,
@@ -66,8 +97,8 @@ const createSubtask = async (req, res) => {
             riskLevel,
             tags,
             skills,
-            startDate,
-            dueDate,
+            startDate: validStartDate,
+            dueDate: validDueDate,
             dependencies,
             status: 'Pending',
             aiGenerated: false
@@ -101,14 +132,40 @@ const getProjectSubtasks = async (req, res) => {
 const generateFallbackSubtasks = (project) => {
     const timelineFactor = Math.max(1, Math.floor((project.timeline || 30) / 7));
 
+    // Proper date handling for fallback subtasks
+    const today = new Date();
+    const todayStr = today.toISOString().split('T')[0];
+
+    const projectStartDate = project.startDate && new Date(project.startDate) >= today
+        ? project.startDate
+        : todayStr;
+
+    const projectDueDate = project.dueDate && new Date(project.dueDate) > new Date(projectStartDate)
+        ? project.dueDate
+        : new Date(Date.now() + (project.timeline || 30) * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+
+    // Calculate phase dates
+    const projectDuration = Math.max(1, Math.floor((new Date(projectDueDate) - new Date(projectStartDate)) / (1000 * 60 * 60 * 24)));
+    const phaseDuration = Math.floor(projectDuration / 3); // Divide into 3 phases
+
+    const planningEndDate = new Date(projectStartDate);
+    planningEndDate.setDate(planningEndDate.getDate() + phaseDuration);
+    const planningEndStr = planningEndDate.toISOString().split('T')[0];
+
+    const executionEndDate = new Date(projectStartDate);
+    executionEndDate.setDate(executionEndDate.getDate() + (phaseDuration * 2));
+    const executionEndStr = executionEndDate.toISOString().split('T')[0];
+
     return [
         {
             title: 'Project Planning and Requirements Analysis',
-            description: `Comprehensive planning for "${project.title}" including scope definition, requirements gathering, and resource planning`,
+            description: `Comprehensive planning for "${project.title || project.name}" including scope definition, requirements gathering, and resource planning`,
             order: 1,
             priority: 'High',
             estimatedHours: 4 * timelineFactor,
-            phase: 'Planning'
+            phase: 'Planning',
+            startDate: projectStartDate,
+            dueDate: planningEndStr
         },
         {
             title: 'Research and Competitive Analysis',
@@ -116,7 +173,9 @@ const generateFallbackSubtasks = (project) => {
             order: 2,
             priority: 'High',
             estimatedHours: 6 * timelineFactor,
-            phase: 'Planning'
+            phase: 'Planning',
+            startDate: projectStartDate,
+            dueDate: planningEndStr
         },
         {
             title: 'System Design and Architecture',
@@ -124,15 +183,19 @@ const generateFallbackSubtasks = (project) => {
             order: 3,
             priority: 'High',
             estimatedHours: 8 * timelineFactor,
-            phase: 'Planning'
+            phase: 'Planning',
+            startDate: projectStartDate,
+            dueDate: planningEndStr
         },
         {
             title: 'Core Development and Implementation',
-            description: `Develop the main features and functionality for ${project.title}`,
+            description: `Develop the main features and functionality for ${project.title || project.name}`,
             order: 4,
             priority: 'High',
             estimatedHours: 16 * timelineFactor,
-            phase: 'Execution'
+            phase: 'Execution',
+            startDate: planningEndStr,
+            dueDate: executionEndStr
         },
         {
             title: 'Integration and System Testing',
@@ -140,7 +203,9 @@ const generateFallbackSubtasks = (project) => {
             order: 5,
             priority: 'Medium',
             estimatedHours: 8 * timelineFactor,
-            phase: 'Review'
+            phase: 'Review',
+            startDate: executionEndStr,
+            dueDate: projectDueDate
         },
         {
             title: 'User Acceptance Testing and Deployment',
@@ -148,7 +213,9 @@ const generateFallbackSubtasks = (project) => {
             order: 6,
             priority: 'Medium',
             estimatedHours: 6 * timelineFactor,
-            phase: 'Review'
+            phase: 'Review',
+            startDate: executionEndStr,
+            dueDate: projectDueDate
         },
         {
             title: 'Documentation and Knowledge Transfer',
@@ -156,7 +223,9 @@ const generateFallbackSubtasks = (project) => {
             order: 7,
             priority: 'Low',
             estimatedHours: 4 * timelineFactor,
-            phase: 'Review'
+            phase: 'Review',
+            startDate: executionEndStr,
+            dueDate: projectDueDate
         }
     ];
 };
@@ -184,14 +253,37 @@ const generateSubtasks = asyncHandler(async (req, res) => {
         await Subtask.deleteMany({ projectId });
     }
 
-    // Prepare project data for AI service
+    // Date validation and formatting - same as chat controller
+    const today = new Date();
+    const todayStr = today.toISOString().split('T')[0]; // YYYY-MM-DD format
+
+    // Validate and fix project startDate
+    let projectStartDate = project.startDate;
+    if (!projectStartDate || new Date(projectStartDate) < today) {
+        projectStartDate = todayStr;
+        // Update the project with corrected start date
+        await Project.findByIdAndUpdate(projectId, { startDate: projectStartDate });
+    }
+
+    // Validate and fix project dueDate
+    let projectDueDate = project.dueDate;
+    const timeline = project.timeline || 30;
+    if (!projectDueDate || new Date(projectDueDate) <= new Date(projectStartDate)) {
+        const calculatedDueDate = new Date(projectStartDate);
+        calculatedDueDate.setDate(calculatedDueDate.getDate() + timeline);
+        projectDueDate = calculatedDueDate.toISOString().split('T')[0];
+        // Update the project with corrected due date
+        await Project.findByIdAndUpdate(projectId, { dueDate: projectDueDate });
+    }
+
+    // Prepare project data for AI service with validated dates
     const projectData = {
-        name: project.title,
-        title: project.title,
+        name: project.title || project.name,
+        title: project.title || project.name,
         description: project.description,
-        timeline: project.timeline || 30,
-        startDate: project.startDate || new Date().toISOString(),
-        dueDate: project.dueDate || new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(),
+        timeline: timeline,
+        startDate: projectStartDate,
+        dueDate: projectDueDate,
         priority: project.priority || 'Medium',
         category: project.category || 'General'
     };
@@ -199,7 +291,7 @@ const generateSubtasks = asyncHandler(async (req, res) => {
     try {
         let aiResponse;
 
-        // CORRECTED METHOD CALL - Using the proper service instance
+        // Try AI service first
         try {
             aiResponse = await aiService.generateProjectTasks(projectData);
             console.log('✅ Successfully used aiService.generateProjectTasks');
@@ -230,8 +322,20 @@ const generateSubtasks = asyncHandler(async (req, res) => {
             throw new Error('Invalid AI response format');
         }
 
-        const subtasks = await Subtask.insertMany(
-            aiResponse.subtasks.map((task, index) => ({
+        // Create subtasks with proper date validation
+        const subtaskData = aiResponse.subtasks.map((task, index) => {
+            // Validate subtask dates against project dates
+            const subtaskStartDate = task.startDate && new Date(task.startDate) >= new Date(projectStartDate)
+                ? task.startDate
+                : projectStartDate;
+
+            const subtaskDueDate = task.dueDate &&
+                new Date(task.dueDate) <= new Date(projectDueDate) &&
+                new Date(task.dueDate) >= new Date(subtaskStartDate)
+                ? task.dueDate
+                : projectDueDate;
+
+            return {
                 projectId,
                 title: task.title,
                 description: task.description,
@@ -245,11 +349,13 @@ const generateSubtasks = asyncHandler(async (req, res) => {
                 riskLevel: task.riskLevel || 'Low',
                 tags: task.tags || [],
                 skills: task.skills || [],
-                startDate: task.startDate,
-                dueDate: task.dueDate,
+                startDate: subtaskStartDate,
+                dueDate: subtaskDueDate,
                 userId: req.user.id
-            }))
-        );
+            };
+        });
+
+        const subtasks = await Subtask.insertMany(subtaskData);
 
         // Update project progress and status
         await updateProjectProgressAndStatus(projectId);
@@ -275,26 +381,29 @@ const generateSubtasks = asyncHandler(async (req, res) => {
     } catch (error) {
         console.error('AI subtask generation error:', error);
 
-        // Enhanced fallback subtask generation
-        const fallbackSubtasks = generateFallbackSubtasks(project);
+        // Enhanced fallback subtask generation with proper date handling
+        const fallbackSubtasks = generateFallbackSubtasks({
+            ...project.toObject(),
+            startDate: projectStartDate,
+            dueDate: projectDueDate,
+            timeline: timeline
+        });
 
         try {
-            const subtasks = await Subtask.insertMany(
-                fallbackSubtasks.map(task => ({
-                    ...task,
-                    estimatedHours: Math.max(0.5, task.estimatedHours || 2),
-                    projectId,
-                    userId: req.user.id,
-                    status: 'Pending',
-                    aiGenerated: false,
-                    complexity: 'Medium',
-                    riskLevel: 'Low',
-                    tags: [],
-                    skills: [],
-                    startDate: project.startDate || new Date().toISOString().split('T')[0],
-                    dueDate: project.dueDate || new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0]
-                }))
-            );
+            const subtaskData = fallbackSubtasks.map(task => ({
+                ...task,
+                estimatedHours: Math.max(0.5, task.estimatedHours || 2),
+                projectId,
+                userId: req.user.id,
+                status: 'Pending',
+                aiGenerated: false,
+                complexity: 'Medium',
+                riskLevel: 'Low',
+                tags: [],
+                skills: []
+            }));
+
+            const subtasks = await Subtask.insertMany(subtaskData);
 
             await updateProjectProgressAndStatus(projectId);
 
@@ -315,7 +424,6 @@ const generateSubtasks = asyncHandler(async (req, res) => {
         }
     }
 });
-
 // ============================================================================
 // ADDITIONAL HELPER METHODS FOR AI INTEGRATION
 // ============================================================================

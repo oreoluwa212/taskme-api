@@ -16,10 +16,41 @@ class AIService {
 
         // Cache for similar project patterns
         this.projectPatterns = new Map();
+
+        this.dailyChatQuota = new Map();
+        this.MAX_DAILY_CHATS = 10;
+    }
+
+    checkQuota(userId) {
+        const today = new Date().toISOString().split('T')[0];
+        let quota = this.dailyChatQuota.get(userId);
+        if (!quota || quota.date !== today) {
+            quota = { date: today, count: 0 };
+        }
+        if (quota.count >= this.MAX_DAILY_CHATS) {
+            return false;
+        }
+        quota.count += 1;
+        this.dailyChatQuota.set(userId, quota);
+        return true;
+    }
+
+    // === NEW: Welcome message ===
+    getWelcomeMessage() {
+        return {
+            message: `👋 Welcome to TaskMe AI! I'm here to help you plan and manage your projects.
+
+To get started, please tell me:
+- What is your project about?
+- What is your desired timeline (in days)?
+- When would you like to start?
+
+This info helps me break down your project into actionable tasks with realistic deadlines.`,
+            type: 'welcome'
+        };
     }
 
     // === PROJECT GENERATION METHODS ===
-
     async generateProjectTasks(projectData) {
         console.log('🤖 AIService.generateProjectTasks called with:', {
             name: projectData.name,
@@ -422,8 +453,14 @@ IMPORTANT:
     }
 
     // === CHAT METHODS ===
-
-    async generateChatResponse(userMessage, context = {}) {
+    async generateChatResponse(userMessage, context = {}, userId = 'default') {
+        if (!this.checkQuota(userId)) {
+            return {
+                message: "⚠️ You have reached your daily free chat limit. Please try again tomorrow.",
+                type: 'quota_exceeded'
+            };
+        }
+        // ...existing code...
         try {
             console.log('💬 Generating chat response for:', userMessage.substring(0, 50) + '...');
             const conversationContext = this.buildConversationContext(context.recentMessages);
@@ -523,6 +560,11 @@ Respond with JSON only:
     }
 
     async extractProjectData(message) {
+        const today = new Date();
+        const todayStr = today.getFullYear() + '-' +
+            String(today.getMonth() + 1).padStart(2, '0') + '-' +
+            String(today.getDate()).padStart(2, '0');
+
         const extractionPrompt = `
 Based on this user message, extract project information and provide smart defaults:
 
@@ -535,7 +577,7 @@ Respond with JSON only:
   "name": "clear project title",
   "description": "detailed project description", 
   "timeline": number_of_days,
-  "startDate": "YYYY-MM-DD format (today's date)",
+  "startDate": "${todayStr}",
   "dueDate": "YYYY-MM-DD format (start date + timeline)",
   "dueTime": "17:00",
   "priority": "High|Medium|Low",
@@ -550,22 +592,61 @@ Respond with JSON only:
             const jsonMatch = response.match(/\{[\s\S]*\}/);
 
             if (jsonMatch) {
-                return JSON.parse(jsonMatch[0]);
+                const data = JSON.parse(jsonMatch[0]);
+
+                // Handle both 'name' and 'title' fields for compatibility
+                if (data.title && !data.name) {
+                    data.name = data.title;
+                }
+                if (!data.name && !data.title) {
+                    data.name = "New Project";
+                }
+
+                // Force set startDate to today
+                data.startDate = todayStr;
+
+                // Always recalculate dueDate to ensure it's in the future
+                if (data.timeline && data.timeline > 0) {
+                    const dueDate = new Date(today);
+                    dueDate.setDate(dueDate.getDate() + data.timeline);
+                    data.dueDate = dueDate.getFullYear() + '-' +
+                        String(dueDate.getMonth() + 1).padStart(2, '0') + '-' +
+                        String(dueDate.getDate()).padStart(2, '0');
+                } else {
+                    const dueDate = new Date(today);
+                    dueDate.setDate(dueDate.getDate() + 30);
+                    data.dueDate = dueDate.getFullYear() + '-' +
+                        String(dueDate.getMonth() + 1).padStart(2, '0') + '-' +
+                        String(dueDate.getDate()).padStart(2, '0');
+                    data.timeline = 30;
+                }
+
+                console.log('✅ Project data extracted:', {
+                    name: data.name,
+                    startDate: data.startDate,
+                    dueDate: data.dueDate,
+                    timeline: data.timeline
+                });
+
+                return data;
             }
         } catch (error) {
             console.error('❌ Error extracting project data:', error);
         }
 
-        // Fallback project data
-        const today = new Date();
-        const dueDate = new Date(today.getTime() + (30 * 24 * 60 * 60 * 1000));
+        // Fallback project data with correct field names
+        const dueDate = new Date(today);
+        dueDate.setDate(dueDate.getDate() + 30);
+        const dueDateStr = dueDate.getFullYear() + '-' +
+            String(dueDate.getMonth() + 1).padStart(2, '0') + '-' +
+            String(dueDate.getDate()).padStart(2, '0');
 
         return {
-            name: "New Project",
+            name: "New Project", // Ensure 'name' field is always present
             description: "Project description to be refined",
             timeline: 30,
-            startDate: today.toISOString().split('T')[0],
-            dueDate: dueDate.toISOString().split('T')[0],
+            startDate: todayStr,
+            dueDate: dueDateStr,
             dueTime: "17:00",
             priority: "Medium",
             category: "General",
@@ -577,8 +658,9 @@ Respond with JSON only:
     formatProjectCreationResponse(projectData, subtasksResponse) {
         const taskCount = subtasksResponse.subtasks?.length || 0;
         const hours = subtasksResponse.totalEstimatedHours || 0;
+        const projectName = projectData.name || projectData.title || "New Project";
 
-        return `Great! I've analyzed your request and created a project plan for "${projectData.name}".
+        return `Great! I've analyzed your request and created a project plan for "${projectName}".
 
 📋 **Project Overview:**
 • **Timeline:** ${projectData.timeline} days
@@ -612,7 +694,7 @@ Would you like me to create this project for you? Click the "Create Project" but
     async interceptAndEnhancePrompt(chatMessage) {
         // This method exists for backward compatibility
         const analysis = await this.analyzeForProjectCreation(chatMessage);
-        
+
         if (analysis.isProjectRequest) {
             const projectData = await this.extractProjectData(chatMessage);
             return {

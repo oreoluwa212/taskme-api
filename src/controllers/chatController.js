@@ -1,6 +1,8 @@
 // src/controllers/chatController.js - Fixed with proper chat types
 const asyncHandler = require('express-async-handler');
 const aiChatService = require('../services/aiChatService');
+const aiService = require('../services/aiService');
+const User = require('../models/User');
 const Chat = require('../models/Chat');
 const Message = require('../models/Message');
 const Project = require('../models/Project');
@@ -261,17 +263,18 @@ const createChatWithSuggestion = asyncHandler(async (req, res) => {
         // If autoStart is enabled, create initial message
         let initialMessage = null;
         if (autoStart) {
-            const welcomeMessages = {
-                project_creation: "I'm ready to help you plan your project! Tell me about what you want to create, and I'll help you break it down into manageable tasks with timelines.",
-                task_generation: "Let's organize your tasks! Share your goals or what you need to accomplish, and I'll help you create a structured action plan.",
-                project_management: "I'm here to help optimize your project! Tell me about your current project status and any challenges you're facing.",
-                learning_journey: "Let's create your learning plan! What skill or subject would you like to master, and what's your timeline?",
-                productivity_planning: "Let's boost your productivity! Tell me about your current workflow and goals, and I'll help you design a better system.",
-                career_development: "I'm excited to help with your career growth! What's your current role and where do you want to be?",
-                default: "I'm ready to help you with your planning and organization! What would you like to work on today?"
-            };
-
-            const welcomeMessage = welcomeMessages[finalChatType] || welcomeMessages.default;
+            let welcomeMessage;
+            if (finalChatType === 'project_creation') {
+                // Use AI welcome message for project creation
+                const welcomeObj = aiService.getWelcomeMessage();
+                welcomeMessage = welcomeObj.message;
+            } else {
+                // Fallback to previous logic for other types
+                const welcomeMessages = {
+                    // ...existing welcomeMessages...
+                };
+                welcomeMessage = welcomeMessages[finalChatType] || welcomeMessages.default;
+            }
 
             initialMessage = await Message.create({
                 chatId: chat._id,
@@ -281,7 +284,6 @@ const createChatWithSuggestion = asyncHandler(async (req, res) => {
                 type: 'system'
             });
 
-            // Update chat's last message
             await Chat.findByIdAndUpdate(chat._id, {
                 lastMessage: initialMessage._id
             });
@@ -397,11 +399,14 @@ const sendMessage = asyncHandler(async (req, res) => {
     }
 
     try {
+        const user = await User.findById(req.user.id).select('avatar');
+
         const userMessage = await Message.create({
             chatId,
             content: content.trim(),
             sender: 'user',
-            userId: req.user.id
+            userId: req.user.id,
+            avatar: user?.avatar // Add avatar field
         });
 
         const recentMessages = await Message.find({ chatId })
@@ -416,13 +421,14 @@ const sendMessage = asyncHandler(async (req, res) => {
             recentMessages: recentMessages.reverse()
         };
 
-        const aiResponse = await aiChatService.generateChatResponse(content, context);
+        const aiResponse = await aiChatService.generateChatResponse(content, context, req.user.id);
 
         const assistantMessage = await Message.create({
             chatId,
             content: aiResponse.message,
             sender: 'assistant',
-            userId: null
+            userId: null,
+            avatar: null // Or set a default assistant avatar if you have one
         });
 
         const updateData = {
@@ -462,7 +468,6 @@ const sendMessage = asyncHandler(async (req, res) => {
         });
     }
 });
-
 const createProjectFromChat = asyncHandler(async (req, res) => {
     const { chatId } = req.params;
 
@@ -499,41 +504,79 @@ const createProjectFromChat = asyncHandler(async (req, res) => {
             });
         }
 
+        // Validation fixes for project data
+        const projectData = projectResponse.projectData;
+
+        // Handle name/title field compatibility
+        const projectName = projectData.name || projectData.title || "New Project";
+
+        // Date validation - ensure dates are valid and in correct format
+        const today = new Date();
+        const todayStr = today.toISOString().split('T')[0]; // YYYY-MM-DD format
+
+        // Validate and fix startDate
+        let startDate = projectData.startDate;
+        if (!startDate || new Date(startDate) < today) {
+            startDate = todayStr;
+        }
+
+        // Validate and fix dueDate
+        let dueDate = projectData.dueDate;
+        const timeline = projectData.timeline || 30;
+        if (!dueDate || new Date(dueDate) <= new Date(startDate)) {
+            const calculatedDueDate = new Date(startDate);
+            calculatedDueDate.setDate(calculatedDueDate.getDate() + timeline);
+            dueDate = calculatedDueDate.toISOString().split('T')[0];
+        }
+
+        // Create project with validated data
         const project = await Project.create({
-            name: projectResponse.projectData.title,
-            description: projectResponse.projectData.description,
-            timeline: projectResponse.projectData.timeline,
-            startDate: projectResponse.projectData.startDate,
-            dueDate: projectResponse.projectData.dueDate,
-            dueTime: projectResponse.projectData.dueTime || '17:00',
-            priority: projectResponse.projectData.priority,
-            category: projectResponse.projectData.category,
-            tags: projectResponse.projectData.tags || [],
+            name: projectName, // Use the validated name
+            description: projectData.description || "Project description to be refined",
+            timeline: timeline,
+            startDate: startDate,
+            dueDate: dueDate,
+            dueTime: projectData.dueTime || '17:00',
+            priority: projectData.priority || 'Medium',
+            category: projectData.category || 'General',
+            tags: Array.isArray(projectData.tags) ? projectData.tags : [],
             userId: req.user.id,
             status: 'Pending',
             createdFromChat: chatId
         });
 
         let subtasks = [];
-        if (projectResponse.subtasks && projectResponse.subtasks.length > 0) {
-            const subtaskData = projectResponse.subtasks.map((task, index) => ({
-                projectId: project._id,
-                title: task.title,
-                description: task.description,
-                order: task.order || (index + 1),
-                priority: task.priority || 'Medium',
-                estimatedHours: Math.max(0.5, task.estimatedHours || 2), // Clamp to 0.5 minimum
-                status: 'Pending',
-                aiGenerated: true,
-                phase: task.phase || 'Execution',
-                startDate: task.startDate,
-                dueDate: task.dueDate,
-                userId: req.user.id
-            }));
+        if (projectResponse.subtasks && Array.isArray(projectResponse.subtasks) && projectResponse.subtasks.length > 0) {
+            const subtaskData = projectResponse.subtasks.map((task, index) => {
+                // Validate subtask data
+                const subtaskStartDate = task.startDate && new Date(task.startDate) >= new Date(startDate)
+                    ? task.startDate
+                    : startDate;
+
+                const subtaskDueDate = task.dueDate && new Date(task.dueDate) <= new Date(dueDate)
+                    ? task.dueDate
+                    : dueDate;
+
+                return {
+                    projectId: project._id,
+                    title: task.title || `Task ${index + 1}`,
+                    description: task.description || '',
+                    order: task.order || (index + 1),
+                    priority: task.priority || 'Medium',
+                    estimatedHours: Math.max(0.5, parseFloat(task.estimatedHours) || 2), // Clamp to 0.5 minimum
+                    status: 'Pending',
+                    aiGenerated: true,
+                    phase: task.phase || 'Execution',
+                    startDate: subtaskStartDate,
+                    dueDate: subtaskDueDate,
+                    userId: req.user.id
+                };
+            });
 
             subtasks = await Subtask.insertMany(subtaskData);
         }
 
+        // Create success message with proper project name
         await Message.create({
             chatId,
             content: `🎉 Project "${project.name}" created successfully with ${subtasks.length} tasks! You can view it in your projects dashboard.`,
@@ -597,6 +640,129 @@ const createProjectFromChat = asyncHandler(async (req, res) => {
     }
 });
 
+// Helper methods for the controller
+const formatProjectCreationResponse = (projectData, subtasksResponse) => {
+    const taskCount = subtasksResponse.subtasks?.length || 0;
+    const hours = subtasksResponse.totalEstimatedHours || 0;
+    const projectName = projectData.name || projectData.title || "New Project";
+
+    return `Great! I've analyzed your request and created a project plan for "${projectName}".
+
+📋 **Project Overview:**
+• **Timeline:** ${projectData.timeline} days
+• **Priority:** ${projectData.priority}
+• **Category:** ${projectData.category}
+
+📝 **Generated Tasks:** ${taskCount} tasks
+⏱️ **Estimated Time:** ${hours} hours
+
+${taskCount > 0 ? '**Tasks include:**\n' + subtasksResponse.subtasks.slice(0, 3).map((task, i) => `${i + 1}. ${task.title}`).join('\n') : ''}
+${taskCount > 3 ? `... and ${taskCount - 3} more tasks` : ''}
+
+Would you like me to create this project for you? Click the "Create Project" button to add it to your dashboard with all the tasks ready to go!`;
+};
+
+const extractProjectData = async (message) => {
+    const today = new Date();
+    const todayStr = today.getFullYear() + '-' +
+        String(today.getMonth() + 1).padStart(2, '0') + '-' +
+        String(today.getDate()).padStart(2, '0');
+
+    const extractionPrompt = `
+Based on this user message, extract project information and provide smart defaults:
+
+User message: "${message}"
+
+Create a comprehensive project structure. If specific information is not provided, use intelligent defaults.
+
+Respond with JSON only:
+{
+  "name": "clear project title",
+  "description": "detailed project description", 
+  "timeline": number_of_days,
+  "startDate": "${todayStr}",
+  "dueDate": "YYYY-MM-DD format (start date + timeline)",
+  "dueTime": "17:00",
+  "priority": "High|Medium|Low",
+  "category": "Development|Marketing|Research|Planning|Personal|Business|Other",
+  "tags": ["relevant", "tags"],
+  "estimatedComplexity": "Low|Medium|High"
+}`;
+
+    try {
+        const result = await this.model.generateContent(extractionPrompt);
+        const response = result.response.text();
+        const jsonMatch = response.match(/\{[\s\S]*\}/);
+
+        if (jsonMatch) {
+            const data = JSON.parse(jsonMatch[0]);
+
+            // Handle both 'name' and 'title' fields for compatibility
+            if (data.title && !data.name) {
+                data.name = data.title;
+            }
+            if (!data.name && !data.title) {
+                data.name = "New Project";
+            }
+
+            // Force set startDate to today
+            data.startDate = todayStr;
+
+            // Always recalculate dueDate to ensure it's in the future
+            if (data.timeline && data.timeline > 0) {
+                const dueDate = new Date(today);
+                dueDate.setDate(dueDate.getDate() + data.timeline);
+                data.dueDate = dueDate.getFullYear() + '-' +
+                    String(dueDate.getMonth() + 1).padStart(2, '0') + '-' +
+                    String(dueDate.getDate()).padStart(2, '0');
+            } else {
+                const dueDate = new Date(today);
+                dueDate.setDate(dueDate.getDate() + 30);
+                data.dueDate = dueDate.getFullYear() + '-' +
+                    String(dueDate.getMonth() + 1).padStart(2, '0') + '-' +
+                    String(dueDate.getDate()).padStart(2, '0');
+                data.timeline = 30;
+            }
+
+            // Validate that tags is an array
+            if (!Array.isArray(data.tags)) {
+                data.tags = [];
+            }
+
+            console.log('✅ Project data extracted:', {
+                name: data.name,
+                startDate: data.startDate,
+                dueDate: data.dueDate,
+                timeline: data.timeline
+            });
+
+            return data;
+        }
+    } catch (error) {
+        console.error('❌ Error extracting project data:', error);
+    }
+
+    // Fallback project data with correct field names
+    const dueDate = new Date(today);
+    dueDate.setDate(dueDate.getDate() + 30);
+    const dueDateStr = dueDate.getFullYear() + '-' +
+        String(dueDate.getMonth() + 1).padStart(2, '0') + '-' +
+        String(dueDate.getDate()).padStart(2, '0');
+
+    return {
+        name: "New Project", // Ensure 'name' field is always present
+        description: "Project description to be refined",
+        timeline: 30,
+        startDate: todayStr,
+        dueDate: dueDateStr,
+        dueTime: "17:00",
+        priority: "Medium",
+        category: "General",
+        tags: [],
+        estimatedComplexity: "Medium"
+    };
+};
+
 const deleteChat = asyncHandler(async (req, res) => {
     const { chatId } = req.params;
 
@@ -657,6 +823,8 @@ module.exports = {
     createChatWithSuggestion,
     sendMessage,
     createProjectFromChat,
+    formatProjectCreationResponse,
+    extractProjectData,
     deleteChat,
     updateChatTitle,
     getChatSuggestions
