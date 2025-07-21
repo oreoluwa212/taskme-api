@@ -1,16 +1,15 @@
 // src/controllers/subtaskController.js
 const Subtask = require('../models/Subtask');
 const Project = require('../models/Project');
-const { AIProjectService, AIChatService } = require('../services/aiService');
 const { updateProjectProgressAndStatus } = require('./projectController');
 const mongoose = require('mongoose');
 const asyncHandler = require('express-async-handler');
+const aiService = require('../services/aiService');
 
 // ============================================================================
 // HELPER METHODS FOR AI INTEGRATION
 // ============================================================================
 
-// Helper method for generating basic tasks from chat extraction
 const generateBasicTasksFromExtraction = async (extractedProject, projectData) => {
     const basicPhases = ['Planning', 'Execution', 'Review'];
     const tasksPerPhase = Math.ceil(6 / basicPhases.length);
@@ -25,7 +24,7 @@ const generateBasicTasksFromExtraction = async (extractedProject, projectData) =
                 description: `${phase} activities for ${projectData.description?.substring(0, 100)}...`,
                 order: order++,
                 priority: phaseIndex === 0 ? 'High' : 'Medium',
-                estimatedHours: Math.ceil(projectData.timeline / 6),
+                estimatedHours: Math.max(0.5, Math.ceil(projectData.timeline / 6)),
                 phase: phase,
                 complexity: extractedProject.estimatedComplexity || 'Medium'
             });
@@ -38,6 +37,64 @@ const generateBasicTasksFromExtraction = async (extractedProject, projectData) =
         criticalPath: [0, Math.floor(subtasks.length / 2), subtasks.length - 1],
         generatedFrom: 'chat_extraction'
     };
+};
+
+// Create a new subtask
+const createSubtask = async (req, res) => {
+    try {
+        const { projectId, title, description, order, priority, estimatedHours, phase, complexity, riskLevel, tags, skills, startDate, dueDate, dependencies } = req.body;
+
+        if (!mongoose.Types.ObjectId.isValid(projectId)) {
+            return res.status(400).json({ success: false, message: 'Invalid project ID' });
+        }
+
+        const project = await Project.findOne({ _id: projectId, userId: req.user.id });
+        if (!project) {
+            return res.status(404).json({ success: false, message: 'Project not found or unauthorized' });
+        }
+
+        const subtask = await Subtask.create({
+            projectId,
+            userId: req.user.id,
+            title,
+            description,
+            order,
+            priority,
+            estimatedHours: Math.max(0.5, estimatedHours || 2),
+            phase,
+            complexity,
+            riskLevel,
+            tags,
+            skills,
+            startDate,
+            dueDate,
+            dependencies,
+            status: 'Pending',
+            aiGenerated: false
+        });
+
+        // Update project progress and status
+        await updateProjectProgressAndStatus(projectId);
+
+        res.status(201).json({ success: true, data: subtask });
+    } catch (error) {
+        console.error('Create subtask error:', error);
+        res.status(500).json({ success: false, message: 'Server error while creating subtask' });
+    }
+};
+
+const getProjectSubtasks = async (req, res) => {
+    try {
+        const { projectId } = req.params;
+        if (!mongoose.Types.ObjectId.isValid(projectId)) {
+            return res.status(400).json({ success: false, message: 'Invalid project ID' });
+        }
+        const subtasks = await Subtask.find({ projectId, userId: req.user.id }).sort({ order: 1 });
+        res.status(200).json({ success: true, data: subtasks });
+    } catch (error) {
+        console.error('Get project subtasks error:', error);
+        res.status(500).json({ success: false, message: 'Server error while fetching subtasks' });
+    }
 };
 
 // Enhanced fallback subtask generation
@@ -144,16 +201,15 @@ const generateSubtasks = asyncHandler(async (req, res) => {
 
         // CORRECTED METHOD CALL - Using the proper service instance
         try {
-            // Method 1: Using AIProjectService directly (recommended)
-            aiResponse = await AIProjectService.generateProjectTasks(projectData);
-            console.log('✅ Successfully used AIProjectService.generateProjectTasks');
+            aiResponse = await aiService.generateProjectTasks(projectData);
+            console.log('✅ Successfully used aiService.generateProjectTasks');
         } catch (aiError) {
-            console.log('❌ AIProjectService failed, trying fallback methods:', aiError.message);
+            console.log('❌ AIService failed, trying fallback methods:', aiError.message);
 
             // Method 2: Try alternative method names or chat service extraction
             try {
                 // Try the chat service's project extraction as fallback
-                const extractedProject = AIChatService.extractProjectFromConversation([
+                const extractedProject = aiService.extractProjectFromConversation([
                     { sender: 'user', content: project.description }
                 ]);
 
@@ -174,7 +230,6 @@ const generateSubtasks = asyncHandler(async (req, res) => {
             throw new Error('Invalid AI response format');
         }
 
-        // Convert AI response to subtasks format
         const subtasks = await Subtask.insertMany(
             aiResponse.subtasks.map((task, index) => ({
                 projectId,
@@ -182,7 +237,7 @@ const generateSubtasks = asyncHandler(async (req, res) => {
                 description: task.description,
                 order: task.order || (index + 1),
                 priority: task.priority || 'Medium',
-                estimatedHours: task.estimatedHours || 2,
+                estimatedHours: Math.max(0.5, task.estimatedHours || 2),
                 status: 'Pending',
                 aiGenerated: true,
                 phase: task.phase || 'Execution',
@@ -227,6 +282,7 @@ const generateSubtasks = asyncHandler(async (req, res) => {
             const subtasks = await Subtask.insertMany(
                 fallbackSubtasks.map(task => ({
                     ...task,
+                    estimatedHours: Math.max(0.5, task.estimatedHours || 2),
                     projectId,
                     userId: req.user.id,
                     status: 'Pending',
@@ -263,181 +319,6 @@ const generateSubtasks = asyncHandler(async (req, res) => {
 // ============================================================================
 // ADDITIONAL HELPER METHODS FOR AI INTEGRATION
 // ============================================================================
-
-// Method to test AI service connectivity
-const testAIConnection = async (req, res) => {
-    try {
-        // Test both services
-        const projectTest = await AIProjectService.testConnection?.() || { success: false, message: 'Method not available' };
-        const chatTest = await AIChatService.testConnection();
-
-        res.status(200).json({
-            success: true,
-            services: {
-                projectService: projectTest,
-                chatService: chatTest
-            },
-            timestamp: new Date().toISOString()
-        });
-    } catch (error) {
-        res.status(500).json({
-            success: false,
-            message: 'AI service test failed',
-            error: error.message
-        });
-    }
-};
-
-// Method to get AI service usage statistics
-const getAIUsageStats = async (req, res) => {
-    try {
-        const chatStats = AIChatService.getUsageStats();
-
-        res.status(200).json({
-            success: true,
-            usage: chatStats,
-            cacheInfo: {
-                projectPatternsSize: AIProjectService.projectPatterns?.size || 0,
-                chatCacheSize: chatStats.cacheSize
-            }
-        });
-    } catch (error) {
-        res.status(500).json({
-            success: false,
-            message: 'Failed to get AI usage statistics',
-            error: error.message
-        });
-    }
-};
-
-// Get all subtasks for a project
-const getProjectSubtasks = async (req, res) => {
-    try {
-        const { projectId } = req.params;
-        const { status, priority, sortBy = 'order', sortOrder = 'asc' } = req.query;
-
-        if (!mongoose.Types.ObjectId.isValid(projectId)) {
-            return res.status(400).json({
-                success: false,
-                message: 'Invalid project ID'
-            });
-        }
-
-        // Verify project belongs to user
-        const project = await Project.findOne({
-            _id: projectId,
-            userId: req.user.id
-        });
-
-        if (!project) {
-            return res.status(404).json({
-                success: false,
-                message: 'Project not found'
-            });
-        }
-
-        let query = { projectId, userId: req.user.id };
-
-        // Apply filters
-        if (status) query.status = status;
-        if (priority) query.priority = priority;
-
-        // Sort options
-        const sortOptions = {};
-        sortOptions[sortBy] = sortOrder === 'asc' ? 1 : -1;
-
-        const subtasks = await Subtask.find(query)
-            .sort(sortOptions)
-            .populate('dependencies', 'title status');
-
-        // Update project progress and status
-        const projectUpdate = await updateProjectProgressAndStatus(projectId);
-        const progress = projectUpdate ? projectUpdate.stats : null;
-
-        res.status(200).json({
-            success: true,
-            count: subtasks.length,
-            progress,
-            data: subtasks
-        });
-    } catch (error) {
-        console.error('Get project subtasks error:', error);
-        res.status(500).json({
-            success: false,
-            message: 'Server error while fetching subtasks'
-        });
-    }
-};
-
-// Create a new subtask
-const createSubtask = async (req, res) => {
-    try {
-        const { projectId } = req.params;
-        const subtaskData = req.body;
-
-        if (!mongoose.Types.ObjectId.isValid(projectId)) {
-            return res.status(400).json({
-                success: false,
-                message: 'Invalid project ID'
-            });
-        }
-
-        // Verify project belongs to user
-        const project = await Project.findOne({
-            _id: projectId,
-            userId: req.user.id
-        });
-
-        if (!project) {
-            return res.status(404).json({
-                success: false,
-                message: 'Project not found'
-            });
-        }
-
-        // If no order specified, set it to the last position
-        if (!subtaskData.order) {
-            const lastSubtask = await Subtask.findOne({ projectId })
-                .sort({ order: -1 })
-                .select('order');
-            subtaskData.order = lastSubtask ? lastSubtask.order + 1 : 1;
-        }
-
-        const subtask = new Subtask({
-            ...subtaskData,
-            projectId,
-            userId: req.user.id,
-            aiGenerated: false
-        });
-
-        await subtask.save();
-
-        // Update project progress and status after creating subtask
-        await updateProjectProgressAndStatus(projectId);
-
-        res.status(201).json({
-            success: true,
-            message: 'Subtask created successfully',
-            data: subtask
-        });
-    } catch (error) {
-        console.error('Create subtask error:', error);
-
-        if (error.name === 'ValidationError') {
-            const errors = Object.values(error.errors).map(err => err.message);
-            return res.status(400).json({
-                success: false,
-                message: 'Validation error',
-                errors
-            });
-        }
-
-        res.status(500).json({
-            success: false,
-            message: 'Server error while creating subtask'
-        });
-    }
-};
 
 // Update a subtask
 const updateSubtask = async (req, res) => {

@@ -522,7 +522,7 @@ const createProjectFromChat = asyncHandler(async (req, res) => {
                 description: task.description,
                 order: task.order || (index + 1),
                 priority: task.priority || 'Medium',
-                estimatedHours: task.estimatedHours || 2,
+                estimatedHours: Math.max(0.5, task.estimatedHours || 2), // Clamp to 0.5 minimum
                 status: 'Pending',
                 aiGenerated: true,
                 phase: task.phase || 'Execution',
@@ -554,8 +554,21 @@ const createProjectFromChat = asyncHandler(async (req, res) => {
                 subtasksCount: subtasks.length
             }
         });
-
     } catch (error) {
+        // Handle AI service overload (503) gracefully
+        if (error.status === 503 || error.statusCode === 503) {
+            await Message.create({
+                chatId,
+                content: "The AI service is currently overloaded. Please try again in a few minutes.",
+                sender: 'assistant',
+                userId: null
+            });
+            return res.status(503).json({
+                success: false,
+                message: 'The AI service is currently overloaded. Please try again in a few minutes.'
+            });
+        }
+
         console.error('Project creation from chat error:', error);
 
         await Message.create({

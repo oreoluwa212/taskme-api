@@ -97,40 +97,95 @@ const updateProjectProgressAndStatus = async (projectId) => {
 
 // Helper function to resolve dependencies after all subtasks are created
 const resolveDependencies = async (subtasks, aiSubtasksData) => {
-    // Create a mapping of task titles to their ObjectIds
-    const titleToIdMap = {};
-    subtasks.forEach((subtask, index) => {
-        const originalTitle = aiSubtasksData[index].title;
-        titleToIdMap[originalTitle] = subtask._id;
-    });
+    try {
+        // Create a mapping of task indices to their ObjectIds
+        const indexToIdMap = {};
+        subtasks.forEach((subtask, index) => {
+            indexToIdMap[index] = subtask._id;
+        });
 
-    // Update dependencies for each subtask
-    const updatePromises = subtasks.map(async (subtask, index) => {
-        const originalDependencies = aiSubtasksData[index].dependencies;
+        // Update dependencies for each subtask
+        const updatePromises = subtasks.map(async (subtask, index) => {
+            const originalDependencies = aiSubtasksData[index].dependencies;
 
-        if (originalDependencies && Array.isArray(originalDependencies) && originalDependencies.length > 0) {
-            // Convert dependency titles to ObjectIds
-            const resolvedDependencies = originalDependencies
-                .map(depTitle => {
-                    // Handle both string and array formats from AI
-                    const cleanTitle = Array.isArray(depTitle) ? depTitle[0] : depTitle;
-                    return titleToIdMap[cleanTitle];
-                })
-                .filter(id => id !== undefined); // Remove any unresolved dependencies
+            if (originalDependencies && Array.isArray(originalDependencies) && originalDependencies.length > 0) {
+                // Convert dependency indices to ObjectIds
+                const resolvedDependencies = originalDependencies
+                    .map(depIndex => {
+                        // Ensure the dependency index is a valid number and within range
+                        const idx = parseInt(depIndex);
+                        if (isNaN(idx) || idx < 0 || idx >= subtasks.length) {
+                            console.warn(`Invalid dependency index: ${depIndex} for task ${index}`);
+                            return null;
+                        }
+                        return indexToIdMap[idx];
+                    })
+                    .filter(id => id !== null); // Remove any invalid dependencies
 
-            if (resolvedDependencies.length > 0) {
-                return await Subtask.findByIdAndUpdate(
-                    subtask._id,
-                    { dependencies: resolvedDependencies },
-                    { new: true }
-                );
+                if (resolvedDependencies.length > 0) {
+                    return await Subtask.findByIdAndUpdate(
+                        subtask._id,
+                        { dependencies: resolvedDependencies },
+                        { new: true }
+                    );
+                }
             }
-        }
 
-        return subtask;
-    });
+            return subtask;
+        });
 
-    return await Promise.all(updatePromises);
+        return await Promise.all(updatePromises);
+    } catch (error) {
+        console.error('Error resolving dependencies:', error);
+        return subtasks; // Return original subtasks if dependency resolution fails
+    }
+};
+
+// Helper function to validate and normalize project data
+const normalizeProjectData = (data, source = 'form') => {
+    const now = new Date();
+
+    if (source === 'ai') {
+        // Handle AI-generated project data
+        const startDate = data.startDate ? new Date(data.startDate) : now;
+        const dueDate = data.dueDate ? new Date(data.dueDate) : new Date(now.getTime() + (30 * 24 * 60 * 60 * 1000));
+
+        return {
+            name: data.name || 'Untitled Project',
+            description: data.description || '',
+            timeline: parseInt(data.timeline) || 30,
+            startDate,
+            dueDate,
+            dueTime: data.dueTime || '17:00',
+            priority: data.priority || 'Medium',
+            category: data.category || 'General',
+            tags: Array.isArray(data.tags) ? data.tags : [],
+            // AI-specific fields
+            technicalRequirements: data.technicalRequirements,
+            projectScope: data.projectScope,
+            deliverables: data.deliverables,
+            successCriteria: data.successCriteria,
+            riskFactors: data.riskFactors,
+            estimatedComplexity: data.estimatedComplexity,
+            recommendedTeamSize: data.recommendedTeamSize,
+            enhancementMetadata: data.enhancementMetadata,
+            aiGenerated: true
+        };
+    } else {
+        // Handle form-submitted data
+        return {
+            name: data.name,
+            description: data.description,
+            timeline: parseInt(data.timeline),
+            startDate: new Date(data.startDate),
+            dueDate: new Date(data.dueDate),
+            dueTime: data.dueTime,
+            priority: data.priority,
+            category: data.category,
+            tags: Array.isArray(data.tags) ? data.tags : [],
+            aiGenerated: false
+        };
+    }
 };
 
 // Create a new project with optional AI generation
@@ -146,83 +201,160 @@ const createProject = async (req, res) => {
             priority,
             category,
             tags,
-            generateAISubtasks = false  // New option
+            generateAISubtasks = false,
+            // New fields for AI chat integration
+            chatMessage,
+            isFromChat = false,
+            aiProjectData
         } = req.body;
 
-        // Validate required fields
-        if (!name || !description || !timeline || !startDate || !dueDate || !dueTime || !priority) {
-            return res.status(400).json({
-                success: false,
-                message: 'All fields are required'
-            });
-        }
-
-        // Validate dates
-        const start = new Date(startDate);
-        const due = new Date(dueDate);
-
-        if (start >= due) {
-            return res.status(400).json({
-                success: false,
-                message: 'Due date must be after start date'
-            });
-        }
-
-        // Calculate timeline consistency
-        const daysDiff = Math.ceil((due - start) / (1000 * 60 * 60 * 24));
-        if (daysDiff !== parseInt(timeline)) {
-            return res.status(400).json({
-                success: false,
-                message: 'Timeline does not match the difference between start and due dates'
-            });
-        }
-
-        const project = new Project({
-            name,
-            description,
-            timeline: parseInt(timeline),
-            startDate: start,
-            dueDate: due,
-            dueTime,
-            priority,
-            category,
-            tags,
-            userId: req.user.id
-        });
-
-        await project.save();
-
+        let projectData;
         let aiResponse = null;
         let subtasks = [];
 
-        // Generate AI subtasks if requested
-        if (generateAISubtasks) {
+        // Handle different input sources
+        if (isFromChat && chatMessage) {
+            console.log('🤖 Processing chat-based project creation:', chatMessage);
+
             try {
-                aiResponse = await aiService.generateProjectTasks({
-                    name: project.name,
-                    description: project.description,
-                    timeline: project.timeline,
-                    startDate: project.startDate,
-                    dueDate: project.dueDate,
-                    priority: project.priority
+                // Use the enhanced chat response method
+                const chatResponse = await aiService.generateEnhancedChatResponse(chatMessage);
+
+                if (chatResponse.type !== 'project_creation' || !chatResponse.projectData) {
+                    return res.status(400).json({
+                        success: false,
+                        message: 'Unable to create project from chat message. Please provide more details or use the form.',
+                        suggestion: 'Try describing what you want to accomplish in more detail.'
+                    });
+                }
+
+                // Use the extracted project data and subtasks
+                projectData = normalizeProjectData(chatResponse.projectData, 'ai');
+
+                // The enhanced chat response already includes generated subtasks
+                if (chatResponse.subtasks && chatResponse.subtasks.length > 0) {
+                    aiResponse = {
+                        subtasks: chatResponse.subtasks,
+                        totalEstimatedHours: chatResponse.metadata?.estimatedHours || 0,
+                        suggestions: ['AI-generated project from chat'],
+                        fromChat: true
+                    };
+                }
+
+                console.log('✅ Chat-based project data extracted successfully');
+            } catch (chatError) {
+                console.error('❌ Chat processing failed:', chatError);
+                return res.status(400).json({
+                    success: false,
+                    message: 'Unable to process your request. Please try describing your project in more detail.',
+                    error: process.env.NODE_ENV === 'development' ? chatError.message : undefined
                 });
+            }
+
+        } else if (aiProjectData) {
+            // Handle pre-processed AI project data
+            console.log('📋 Processing pre-generated AI project data');
+            projectData = normalizeProjectData(aiProjectData, 'ai');
+
+            if (generateAISubtasks) {
+                try {
+                    aiResponse = await aiService.generateProjectTasks(projectData);
+                    console.log('✅ AI subtasks generated for pre-processed data');
+                } catch (aiError) {
+                    console.error('❌ AI subtask generation failed:', aiError);
+                    // Continue without subtasks if AI fails
+                }
+            }
+
+        } else {
+            // Handle traditional form submission
+            console.log('📝 Processing form-based project creation');
+
+            // Validate required fields for form submission
+            if (!name || !description || !timeline || !startDate || !dueDate || !dueTime || !priority) {
+                return res.status(400).json({
+                    success: false,
+                    message: 'All fields are required for form submission'
+                });
+            }
+
+            projectData = normalizeProjectData(req.body, 'form');
+
+            // Validate dates for form submission
+            if (projectData.startDate >= projectData.dueDate) {
+                return res.status(400).json({
+                    success: false,
+                    message: 'Due date must be after start date'
+                });
+            }
+
+            // Calculate timeline consistency for form submission
+            const daysDiff = Math.ceil((projectData.dueDate - projectData.startDate) / (1000 * 60 * 60 * 24));
+            if (Math.abs(daysDiff - projectData.timeline) > 1) { // Allow 1 day tolerance
+                console.warn('Timeline mismatch detected, adjusting timeline to match dates');
+                projectData.timeline = daysDiff;
+            }
+
+            // Generate AI subtasks if requested
+            if (generateAISubtasks) {
+                try {
+                    aiResponse = await aiService.generateProjectTasks(projectData);
+                    console.log('✅ AI subtasks generated for form data');
+                } catch (aiError) {
+                    console.error('❌ AI subtask generation failed:', aiError);
+                    // Continue without subtasks if AI fails
+                }
+            }
+        }
+
+        // Create the project
+        const project = new Project({
+            ...projectData,
+            userId: req.user.id,
+            progress: 0,
+            status: 'Pending'
+        });
+
+        await project.save();
+        console.log('✅ Project created successfully:', project._id);
+
+        // Create subtasks if AI response exists
+        if (aiResponse && aiResponse.subtasks && aiResponse.subtasks.length > 0) {
+            try {
+                console.log(`🔧 Creating ${aiResponse.subtasks.length} subtasks...`);
 
                 // First, create subtasks without dependencies
-                const subtaskPromises = aiResponse.subtasks.map(subtaskData => {
-                    const { dependencies, ...subtaskWithoutDeps } = subtaskData;
-                    return new Subtask({
-                        ...subtaskWithoutDeps,
+                const subtaskPromises = aiResponse.subtasks.map((subtaskData, index) => {
+                    // Ensure required fields have defaults
+                    const cleanSubtask = {
+                        title: subtaskData.title || `Task ${index + 1}`,
+                        description: subtaskData.description || 'No description provided',
+                        estimatedHours: subtaskData.estimatedHours || 2,
+                        priority: subtaskData.priority || 'Medium',
+                        order: subtaskData.order || (index + 1),
+                        phase: subtaskData.phase || 'Execution',
+                        complexity: subtaskData.complexity || 'Medium',
+                        riskLevel: subtaskData.riskLevel || 'Low',
+                        skills: Array.isArray(subtaskData.skills) ? subtaskData.skills : [],
+                        tags: Array.isArray(subtaskData.tags) ? subtaskData.tags : [],
+                        startDate: subtaskData.startDate || project.startDate,
+                        dueDate: subtaskData.dueDate || project.dueDate,
                         projectId: project._id,
                         userId: req.user.id,
+                        status: 'Pending',
                         aiGenerated: true,
                         dependencies: [] // Initialize with empty dependencies
-                    }).save();
+                    };
+
+                    return new Subtask(cleanSubtask).save();
                 });
 
                 const createdSubtasks = await Promise.all(subtaskPromises);
+                console.log(`✅ Created ${createdSubtasks.length} subtasks`);
 
                 // Now resolve and update dependencies
                 subtasks = await resolveDependencies(createdSubtasks, aiResponse.subtasks);
+                console.log('✅ Dependencies resolved');
 
                 // Update project progress and status based on initial subtasks
                 const projectUpdate = await updateProjectProgressAndStatus(project._id);
@@ -231,27 +363,40 @@ const createProject = async (req, res) => {
                     project.status = projectUpdate.project.status;
                 }
 
-            } catch (aiError) {
-                console.error('AI generation error:', aiError);
-                // Continue without AI subtasks if there's an error
+            } catch (subtaskError) {
+                console.error('❌ Error creating subtasks:', subtaskError);
+                // Continue without subtasks if there's an error, but log the issue
             }
+        }
+
+        // Prepare response data
+        const responseData = {
+            project,
+            subtasks,
+            aiResponse: aiResponse ? {
+                totalEstimatedHours: aiResponse.totalEstimatedHours || 0,
+                criticalPath: aiResponse.criticalPath || [],
+                suggestions: aiResponse.suggestions || [],
+                wasEnhanced: isFromChat || false,
+                fromChat: aiResponse.fromChat || false
+            } : null
+        };
+
+        // Add chat-specific response formatting
+        if (isFromChat) {
+            responseData.chatMessage = `Great! I've created "${project.name}" with ${subtasks.length} tasks. The project is estimated to take ${aiResponse?.totalEstimatedHours || 0} hours and has been added to your dashboard.`;
         }
 
         res.status(201).json({
             success: true,
-            message: 'Project created successfully',
-            data: {
-                project,
-                subtasks,
-                aiResponse: aiResponse ? {
-                    totalEstimatedHours: aiResponse.totalEstimatedHours,
-                    criticalPath: aiResponse.criticalPath,
-                    suggestions: aiResponse.suggestions
-                } : null
-            }
+            message: isFromChat
+                ? 'Project created successfully from chat message!'
+                : 'Project created successfully',
+            data: responseData
         });
+
     } catch (error) {
-        console.error('Create project error:', error);
+        console.error('❌ Create project error:', error);
 
         if (error.name === 'ValidationError') {
             const errors = Object.values(error.errors).map(err => err.message);
@@ -264,7 +409,8 @@ const createProject = async (req, res) => {
 
         res.status(500).json({
             success: false,
-            message: 'Server error while creating project'
+            message: 'Server error while creating project',
+            error: process.env.NODE_ENV === 'development' ? error.message : undefined
         });
     }
 };
