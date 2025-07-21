@@ -264,18 +264,41 @@ const createChatWithSuggestion = asyncHandler(async (req, res) => {
         let initialMessage = null;
         if (autoStart) {
             let welcomeMessage;
+
             if (finalChatType === 'project_creation') {
                 // Use AI welcome message for project creation
-                const welcomeObj = aiService.getWelcomeMessage();
-                welcomeMessage = welcomeObj.message;
+                try {
+                    const welcomeObj = aiService.getWelcomeMessage();
+                    welcomeMessage = welcomeObj.message;
+                } catch (aiError) {
+                    console.error('Error getting AI welcome message:', aiError);
+                    // Fallback to default message if AI service fails
+                    welcomeMessage = "Welcome! I'm here to help you create and manage your project. What would you like to work on today?";
+                }
             } else {
-                // Fallback to previous logic for other types
+                // Define welcome messages for other chat types
                 const welcomeMessages = {
-                    // ...existing welcomeMessages...
+                    general: "Hello! How can I assist you today?",
+                    task_generation: "Welcome! I'm here to help you generate and organize tasks. What project or goal are you working on?",
+                    project_management: "Hi! I'm ready to help you manage your project effectively. What's your current project status?",
+                    learning_journey: "Welcome to your learning journey! What new skills or topics would you like to explore?",
+                    productivity_planning: "Hello! Let's boost your productivity. What areas would you like to focus on?",
+                    career_development: "Welcome! I'm here to support your career growth. What are your professional goals?",
+                    goal_setting: "Hi! Ready to set and achieve your goals? What would you like to accomplish?",
+                    time_management: "Welcome! Let's optimize your time management. What challenges are you facing?",
+                    team_collaboration: "Hello! I'm here to enhance your team collaboration. How can we improve teamwork?",
+                    risk_assessment: "Welcome! Let's identify and assess potential risks. What project or situation should we analyze?",
+                    marketing_campaign: "Hi! Ready to create an effective marketing campaign? What's your product or service?",
+                    event_planning: "Welcome! I'll help you plan a successful event. What type of event are you organizing?",
+                    business_strategy: "Hello! Let's develop your business strategy. What are your key objectives?",
+                    personal_development: "Welcome to your personal development journey! What aspects of yourself would you like to improve?",
+                    default: "Hello! How can I help you today?"
                 };
+
                 welcomeMessage = welcomeMessages[finalChatType] || welcomeMessages.default;
             }
 
+            // Create the initial message
             initialMessage = await Message.create({
                 chatId: chat._id,
                 content: welcomeMessage,
@@ -284,6 +307,7 @@ const createChatWithSuggestion = asyncHandler(async (req, res) => {
                 type: 'system'
             });
 
+            // Update chat with the last message reference
             await Chat.findByIdAndUpdate(chat._id, {
                 lastMessage: initialMessage._id
             });
@@ -309,7 +333,15 @@ const createChatWithSuggestion = asyncHandler(async (req, res) => {
                 errorMessage = `Invalid chat type: ${chatType}. Please use a valid chat type.`;
             } else if (error.errors.category) {
                 errorMessage = `Invalid category: ${category}. Please use a valid category.`;
+            } else {
+                // Handle other validation errors
+                const firstError = Object.values(error.errors)[0];
+                errorMessage = firstError.message || 'Validation failed';
             }
+        } else if (error.name === 'CastError') {
+            errorMessage = 'Invalid data format provided';
+        } else if (error.code === 11000) {
+            errorMessage = 'A chat with similar details already exists';
         }
 
         res.status(400).json({
