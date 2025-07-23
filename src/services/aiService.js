@@ -1,4 +1,4 @@
-// src/services/aiService.js - Unified AI Service
+// src/services/aiService.js - Unified AI Service (Production)
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 
 class AIService {
@@ -16,7 +16,6 @@ class AIService {
 
         // Cache for similar project patterns
         this.projectPatterns = new Map();
-
         this.dailyChatQuota = new Map();
         this.MAX_DAILY_CHATS = 10;
     }
@@ -35,7 +34,6 @@ class AIService {
         return true;
     }
 
-    // === NEW: Welcome message ===
     getWelcomeMessage() {
         return {
             message: `👋 Welcome to TaskMe AI! I'm here to help you plan and manage your projects.
@@ -50,51 +48,29 @@ This info helps me break down your project into actionable tasks with realistic 
         };
     }
 
-    // === PROJECT GENERATION METHODS ===
     async generateProjectTasks(projectData) {
-        console.log('🤖 AIService.generateProjectTasks called with:', {
-            name: projectData.name,
-            timeline: projectData.timeline,
-            priority: projectData.priority
-        });
-
         const { name, description, timeline, startDate, dueDate, priority, category } = projectData;
 
         // Check cache for similar projects
         const cacheKey = this.generateCacheKey(projectData);
         if (this.projectPatterns.has(cacheKey)) {
-            console.log('✅ Using cached project pattern');
             return this.adaptCachedPattern(this.projectPatterns.get(cacheKey), projectData);
         }
 
         const prompt = this.buildProjectTaskPrompt(projectData);
 
         try {
-            console.log('📤 Sending prompt to AI model...');
             const result = await this.model.generateContent(prompt);
             const response = result.response.text();
-
-            console.log('📥 AI response received, parsing...');
-            // Enhanced JSON extraction with better error handling
             const parsedResponse = this.extractAndValidateJSON(response);
-
-            // Post-process the response
             const enhancedResponse = this.enhanceTaskResponse(parsedResponse, projectData);
 
             // Cache successful patterns
             this.projectPatterns.set(cacheKey, enhancedResponse);
 
-            console.log('✅ Project tasks generated successfully:', {
-                totalTasks: enhancedResponse.subtasks?.length || 0,
-                estimatedHours: enhancedResponse.totalEstimatedHours || 0
-            });
-
             return enhancedResponse;
         } catch (error) {
-            console.error('❌ Error generating tasks from AI:', error);
-
             // Fallback to template-based generation
-            console.log('🔄 Using fallback task generation...');
             return this.generateFallbackTasks(projectData);
         }
     }
@@ -102,7 +78,6 @@ This info helps me break down your project into actionable tasks with realistic 
     buildProjectTaskPrompt(projectData) {
         const { name, description, timeline, startDate, dueDate, priority, category } = projectData;
 
-        // Enhanced prompt with better context and examples
         return `
 You are an expert project management AI assistant with extensive experience in breaking down complex projects into manageable tasks.
 
@@ -176,7 +151,6 @@ IMPORTANT:
 
     extractAndValidateJSON(response) {
         try {
-            console.log('🔍 Extracting JSON from AI response...');
             // Try to find JSON in the response
             const jsonMatch = response.match(/\{[\s\S]*\}/);
             if (!jsonMatch) {
@@ -194,8 +168,6 @@ IMPORTANT:
                 throw new Error('No subtasks generated');
             }
 
-            console.log(`✅ Parsed ${parsedResponse.subtasks.length} subtasks from AI response`);
-
             // Validate each subtask and clean up dependencies
             parsedResponse.subtasks.forEach((task, index) => {
                 if (!task.title || !task.description) {
@@ -211,63 +183,221 @@ IMPORTANT:
                 task.riskLevel = task.riskLevel || 'Low';
                 task.skills = task.skills || [];
                 task.tags = task.tags || [];
-
-                // Clean up dependencies - remove for now since we'll handle them after subtask creation
                 task.dependencies = [];
             });
 
             return parsedResponse;
         } catch (error) {
-            console.error('❌ JSON parsing error:', error);
             throw new Error('Failed to parse AI response');
         }
     }
 
     enhanceTaskResponse(parsedResponse, projectData) {
-        console.log('🔧 Enhancing task response with dates and metadata...');
-        const projectStart = new Date(projectData.startDate);
-        const projectEnd = new Date(projectData.dueDate);
-        const totalDays = Math.ceil((projectEnd - projectStart) / (1000 * 60 * 60 * 24));
+        // Enhanced date validation and parsing - ALWAYS use future dates
+        const today = new Date();
+        today.setHours(0, 0, 0, 0);
 
-        // Calculate more intelligent task scheduling
+        let projectStart, projectEnd;
+
+        try {
+            // Parse project dates but ensure they're never in the past
+            const providedStartDate = new Date(projectData.startDate);
+            const providedEndDate = new Date(projectData.dueDate);
+
+            // Force start date to be today or later
+            projectStart = providedStartDate < today ? new Date(today) : providedStartDate;
+
+            // Force end date to be after start date
+            if (providedEndDate <= projectStart) {
+                projectEnd = new Date(projectStart);
+                projectEnd.setDate(projectEnd.getDate() + (projectData.timeline || 30));
+            } else {
+                projectEnd = providedEndDate;
+            }
+
+        } catch (error) {
+            projectStart = new Date(today);
+            projectEnd = new Date(today);
+            projectEnd.setDate(projectEnd.getDate() + (projectData.timeline || 30));
+        }
+
+        const totalTasks = parsedResponse.subtasks.length;
+
+        // Enhanced task scheduling with bulletproof FUTURE-ONLY date handling
         parsedResponse.subtasks = parsedResponse.subtasks.map((task, index) => {
-            // Calculate task duration based on estimated hours
-            const taskDuration = Math.ceil(task.estimatedHours / 8);
+            try {
+                // Calculate task duration based on estimated hours (minimum 1 day)
+                const taskDuration = Math.max(1, Math.ceil((task.estimatedHours || 2) / 8));
 
-            // Calculate start date based on project timeline
-            const taskStartOffset = Math.floor((index / parsedResponse.subtasks.length) * totalDays);
+                let taskStartDate;
 
-            const taskStartDate = new Date(projectStart);
-            taskStartDate.setDate(taskStartDate.getDate() + taskStartOffset);
+                if (index === 0) {
+                    // First task starts on project start date
+                    taskStartDate = new Date(projectStart.getTime());
+                } else {
+                    // Subsequent tasks start after previous task with 1-day buffer
+                    const prevTask = parsedResponse.subtasks[index - 1];
+                    const prevEndDate = new Date(prevTask.dueDate);
 
-            const taskDueDate = new Date(taskStartDate);
-            taskDueDate.setDate(taskDueDate.getDate() + taskDuration);
+                    if (isNaN(prevEndDate.getTime())) {
+                        // Fallback: use project start + index days
+                        taskStartDate = new Date(projectStart.getTime());
+                        taskStartDate.setDate(taskStartDate.getDate() + index);
+                    } else {
+                        taskStartDate = new Date(prevEndDate.getTime());
+                        taskStartDate.setDate(taskStartDate.getDate() + 1);
+                    }
+                }
 
-            return {
-                ...task,
-                startDate: taskStartDate.toISOString(),
-                dueDate: taskDueDate.toISOString(),
-                order: index + 1,
-                projectPhase: this.determineProjectPhase(index, parsedResponse.subtasks.length),
-                estimatedProgress: Math.round(((index + 1) / parsedResponse.subtasks.length) * 100)
-            };
+                // Ensure task start is never in the past
+                if (taskStartDate < today) {
+                    taskStartDate = new Date(today.getTime());
+                    taskStartDate.setDate(taskStartDate.getDate() + index + 1);
+                }
+
+                // Calculate due date
+                const taskDueDate = new Date(taskStartDate.getTime());
+                taskDueDate.setDate(taskDueDate.getDate() + taskDuration);
+
+                // Final safety check - ensure both dates are valid and in the future
+                const safeStartDate = taskStartDate < today ?
+                    (() => {
+                        const safe = new Date(today.getTime());
+                        safe.setDate(safe.getDate() + index + 1);
+                        return safe;
+                    })() : taskStartDate;
+
+                const safeDueDate = taskDueDate <= safeStartDate ?
+                    (() => {
+                        const safe = new Date(safeStartDate.getTime());
+                        safe.setDate(safe.getDate() + Math.max(1, taskDuration));
+                        return safe;
+                    })() : taskDueDate;
+
+                // Validate date objects before formatting
+                if (isNaN(safeStartDate.getTime()) || isNaN(safeDueDate.getTime())) {
+                    // Emergency fix: Sequential future dates
+                    const emergencyStart = new Date(today.getTime());
+                    emergencyStart.setDate(emergencyStart.getDate() + index + 1);
+
+                    const emergencyDue = new Date(emergencyStart.getTime());
+                    emergencyDue.setDate(emergencyDue.getDate() + Math.max(1, taskDuration));
+
+                    return {
+                        ...task,
+                        startDate: emergencyStart.toISOString().split('T')[0],
+                        dueDate: emergencyDue.toISOString().split('T')[0],
+                        order: index + 1,
+                        projectPhase: this.determineProjectPhase(index, totalTasks),
+                        estimatedProgress: Math.round(((index + 1) / totalTasks) * 100),
+                        dateWarning: 'Emergency future dates applied due to invalid date calculation'
+                    };
+                }
+
+                // Format as YYYY-MM-DD strings
+                const formattedStartDate = safeStartDate.toISOString().split('T')[0];
+                const formattedDueDate = safeDueDate.toISOString().split('T')[0];
+
+                // Final validation: Ensure dates are valid and in the future
+                const startDateObj = new Date(formattedStartDate);
+                const dueDateObj = new Date(formattedDueDate);
+
+                if (startDateObj < today || dueDateObj < today || dueDateObj <= startDateObj) {
+                    // Emergency fix: Sequential future dates
+                    const emergencyStart = new Date(today.getTime());
+                    emergencyStart.setDate(emergencyStart.getDate() + index + 1);
+
+                    const emergencyDue = new Date(emergencyStart.getTime());
+                    emergencyDue.setDate(emergencyDue.getDate() + Math.max(1, taskDuration));
+
+                    return {
+                        ...task,
+                        startDate: emergencyStart.toISOString().split('T')[0],
+                        dueDate: emergencyDue.toISOString().split('T')[0],
+                        order: index + 1,
+                        projectPhase: this.determineProjectPhase(index, totalTasks),
+                        estimatedProgress: Math.round(((index + 1) / totalTasks) * 100),
+                        dateWarning: 'Emergency future dates applied after final validation failure'
+                    };
+                }
+
+                return {
+                    ...task,
+                    startDate: formattedStartDate,
+                    dueDate: formattedDueDate,
+                    order: index + 1,
+                    projectPhase: this.determineProjectPhase(index, totalTasks),
+                    estimatedProgress: Math.round(((index + 1) / totalTasks) * 100)
+                };
+
+            } catch (taskError) {
+                // Emergency fallback with guaranteed future dates
+                const fallbackStart = new Date(today.getTime());
+                fallbackStart.setDate(fallbackStart.getDate() + index + 1);
+
+                const fallbackEnd = new Date(fallbackStart.getTime());
+                fallbackEnd.setDate(fallbackEnd.getDate() + 2);
+
+                return {
+                    ...task,
+                    startDate: fallbackStart.toISOString().split('T')[0],
+                    dueDate: fallbackEnd.toISOString().split('T')[0],
+                    order: index + 1,
+                    projectPhase: 'Execution',
+                    estimatedProgress: Math.round(((index + 1) / totalTasks) * 100),
+                    dateWarning: 'Fallback future dates due to processing error'
+                };
+            }
         });
 
-        // Add project-specific enhancements
+        // Final validation - ensure ALL dates are in the future
+        const hasBackdatedTasks = parsedResponse.subtasks.some(task => {
+            const taskStart = new Date(task.startDate);
+            const taskDue = new Date(task.dueDate);
+            return taskStart < today || taskDue < today || isNaN(taskStart.getTime()) || isNaN(taskDue.getTime());
+        });
+
+        if (hasBackdatedTasks) {
+            // Final fix: Re-schedule all tasks sequentially from tomorrow
+            let runningDate = new Date(today.getTime());
+            runningDate.setDate(runningDate.getDate() + 1);
+
+            parsedResponse.subtasks = parsedResponse.subtasks.map((task, index) => {
+                const taskDuration = Math.max(1, Math.ceil((task.estimatedHours || 2) / 8));
+
+                const taskStart = new Date(runningDate.getTime());
+                const taskEnd = new Date(runningDate.getTime());
+                taskEnd.setDate(taskEnd.getDate() + taskDuration);
+
+                // Update running date for next task (add 1 day buffer)
+                runningDate = new Date(taskEnd.getTime());
+                runningDate.setDate(runningDate.getDate() + 1);
+
+                return {
+                    ...task,
+                    startDate: taskStart.toISOString().split('T')[0],
+                    dueDate: taskEnd.toISOString().split('T')[0],
+                    dateWarning: 'Sequentially scheduled to ensure future dates'
+                };
+            });
+        }
+
         return {
             ...parsedResponse,
-            projectInsights: this.generateProjectInsights(parsedResponse, projectData),
-            recommendedTeamSize: this.calculateRecommendedTeamSize(parsedResponse),
-            estimatedBudget: this.estimateBudget(parsedResponse),
-            successMetrics: this.generateSuccessMetrics(projectData)
+            projectInsights: this.generateProjectInsights?.(parsedResponse, projectData),
+            recommendedTeamSize: this.calculateRecommendedTeamSize?.(parsedResponse),
+            estimatedBudget: this.estimateBudget?.(parsedResponse),
+            successMetrics: this.generateSuccessMetrics?.(projectData)
         };
     }
 
     determineProjectPhase(taskIndex, totalTasks) {
-        const progress = (taskIndex + 1) / totalTasks;
-        if (progress <= 0.25) return 'Planning';
-        if (progress <= 0.8) return 'Execution';
-        return 'Review';
+        const percentage = (taskIndex + 1) / totalTasks;
+
+        if (percentage <= 0.25) return 'Planning';
+        if (percentage <= 0.75) return 'Execution';
+        if (percentage <= 0.9) return 'Review';
+        return 'QA';
     }
 
     generateProjectInsights(parsedResponse, projectData) {
@@ -352,8 +482,6 @@ IMPORTANT:
     }
 
     generateFallbackTasks(projectData) {
-        console.log('🔄 Generating fallback tasks for project:', projectData.name);
-
         // Create basic template-based tasks
         const basicTasks = [
             {
@@ -405,8 +533,6 @@ IMPORTANT:
 
         const totalEstimatedHours = basicTasks.reduce((sum, task) => sum + task.estimatedHours, 0);
 
-        console.log(`✅ Generated ${basicTasks.length} fallback tasks`);
-
         return {
             subtasks: basicTasks,
             totalEstimatedHours,
@@ -432,7 +558,6 @@ IMPORTANT:
     }
 
     adaptCachedPattern(cachedPattern, projectData) {
-        console.log('♻️ Adapting cached pattern to current project');
         // Adapt cached pattern to current project
         const adapted = JSON.parse(JSON.stringify(cachedPattern)); // Deep clone
 
@@ -452,7 +577,6 @@ IMPORTANT:
         return adapted;
     }
 
-    // === CHAT METHODS ===
     async generateChatResponse(userMessage, context = {}, userId = 'default') {
         if (!this.checkQuota(userId)) {
             return {
@@ -460,9 +584,8 @@ IMPORTANT:
                 type: 'quota_exceeded'
             };
         }
-        // ...existing code...
+
         try {
-            console.log('💬 Generating chat response for:', userMessage.substring(0, 50) + '...');
             const conversationContext = this.buildConversationContext(context.recentMessages);
 
             const prompt = `You are a helpful AI assistant specializing in project management and productivity. 
@@ -482,7 +605,6 @@ Please provide a helpful, conversational response. If the user is describing a p
             };
 
         } catch (error) {
-            console.error('❌ Error generating chat response:', error);
             return {
                 message: "I'm here to help! Could you tell me more about what you're working on or what you'd like to accomplish?",
                 type: 'fallback'
@@ -492,12 +614,10 @@ Please provide a helpful, conversational response. If the user is describing a p
 
     async generateEnhancedChatResponse(userMessage, context = {}) {
         try {
-            console.log('🤖 Generating enhanced chat response...');
             // First check if this could be a project creation request
             const projectAnalysis = await this.analyzeForProjectCreation(userMessage);
 
             if (projectAnalysis.isProjectRequest) {
-                console.log('📋 Detected project creation request');
                 // Generate project data and tasks
                 const projectData = await this.extractProjectData(userMessage);
                 const subtasks = await this.generateProjectTasks(projectData);
@@ -518,7 +638,6 @@ Please provide a helpful, conversational response. If the user is describing a p
             return await this.generateChatResponse(userMessage, context);
 
         } catch (error) {
-            console.error('❌ Error generating enhanced chat response:', error);
             return await this.generateChatResponse(userMessage, context);
         }
     }
@@ -553,7 +672,7 @@ Respond with JSON only:
                 return analysis;
             }
         } catch (error) {
-            console.error('❌ Error analyzing project creation:', error);
+            // Silent fallback
         }
 
         return { isProjectRequest: false, confidence: 0, reasoning: "Analysis failed" };
@@ -561,6 +680,7 @@ Respond with JSON only:
 
     async extractProjectData(message) {
         const today = new Date();
+        today.setHours(0, 0, 0, 0);
         const todayStr = today.getFullYear() + '-' +
             String(today.getMonth() + 1).padStart(2, '0') + '-' +
             String(today.getDate()).padStart(2, '0');
@@ -571,11 +691,15 @@ Based on this user message, extract project information and provide smart defaul
 User message: "${message}"
 
 Create a comprehensive project structure. If specific information is not provided, use intelligent defaults.
+IMPORTANT: 
+- All dates must be today (${todayStr}) or later
+- Description must be concise and under 400 characters (max 400 chars)
+- Focus on key project objectives and deliverables in the description
 
 Respond with JSON only:
 {
-  "name": "clear project title",
-  "description": "detailed project description", 
+  "name": "clear project title (max 100 characters)",
+  "description": "concise project description focusing on main objectives and deliverables (MAX 400 characters)", 
   "timeline": number_of_days,
   "startDate": "${todayStr}",
   "dueDate": "YYYY-MM-DD format (start date + timeline)",
@@ -602,47 +726,39 @@ Respond with JSON only:
                     data.name = "New Project";
                 }
 
-                // Force set startDate to today
-                data.startDate = todayStr;
+                // Enforce character limits
+                data.name = (data.name || "New Project").substring(0, 100);
+                data.description = (data.description || "Project description to be refined").substring(0, 400);
 
-                // Always recalculate dueDate to ensure it's in the future
-                if (data.timeline && data.timeline > 0) {
-                    const dueDate = new Date(today);
-                    dueDate.setDate(dueDate.getDate() + data.timeline);
-                    data.dueDate = dueDate.getFullYear() + '-' +
-                        String(dueDate.getMonth() + 1).padStart(2, '0') + '-' +
-                        String(dueDate.getDate()).padStart(2, '0');
+                // Force set startDate to today or later
+                const extractedStartDate = data.startDate ? new Date(data.startDate) : today;
+                if (extractedStartDate < today) {
+                    data.startDate = todayStr;
                 } else {
-                    const dueDate = new Date(today);
-                    dueDate.setDate(dueDate.getDate() + 30);
-                    data.dueDate = dueDate.getFullYear() + '-' +
-                        String(dueDate.getMonth() + 1).padStart(2, '0') + '-' +
-                        String(dueDate.getDate()).padStart(2, '0');
-                    data.timeline = 30;
+                    data.startDate = extractedStartDate.toISOString().split('T')[0];
                 }
 
-                console.log('✅ Project data extracted:', {
-                    name: data.name,
-                    startDate: data.startDate,
-                    dueDate: data.dueDate,
-                    timeline: data.timeline
-                });
+                // Ensure timeline is valid
+                data.timeline = Math.max(1, data.timeline || 30);
+
+                // Always recalculate dueDate to ensure it's in the future
+                const dueDate = new Date(data.startDate);
+                dueDate.setDate(dueDate.getDate() + data.timeline);
+                data.dueDate = dueDate.toISOString().split('T')[0];
 
                 return data;
             }
         } catch (error) {
-            console.error('❌ Error extracting project data:', error);
+            // Silent fallback
         }
 
-        // Fallback project data with correct field names
+        // Fallback project data with guaranteed future dates and proper lengths
         const dueDate = new Date(today);
         dueDate.setDate(dueDate.getDate() + 30);
-        const dueDateStr = dueDate.getFullYear() + '-' +
-            String(dueDate.getMonth() + 1).padStart(2, '0') + '-' +
-            String(dueDate.getDate()).padStart(2, '0');
+        const dueDateStr = dueDate.toISOString().split('T')[0];
 
         return {
-            name: "New Project", // Ensure 'name' field is always present
+            name: "New Project",
             description: "Project description to be refined",
             timeline: 30,
             startDate: todayStr,

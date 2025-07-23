@@ -253,40 +253,54 @@ const generateSubtasks = asyncHandler(async (req, res) => {
         await Subtask.deleteMany({ projectId });
     }
 
-    // Date validation and formatting - same as chat controller
+    // CRITICAL DATE VALIDATION AND CORRECTION
     const today = new Date();
-    const todayStr = today.toISOString().split('T')[0]; // YYYY-MM-DD format
+    today.setHours(0, 0, 0, 0); // Remove time component
+    const todayStr = today.toISOString().split('T')[0];
 
-    // Validate and fix project startDate
+    // Validate and fix project startDate - MUST be today or later
     let projectStartDate = project.startDate;
-    if (!projectStartDate || new Date(projectStartDate) < today) {
+    const originalStartDate = new Date(projectStartDate);
+
+    if (!projectStartDate || originalStartDate < today) {
         projectStartDate = todayStr;
-        // Update the project with corrected start date
+        console.log(`🔧 Correcting project start date from ${project.startDate} to ${projectStartDate}`);
         await Project.findByIdAndUpdate(projectId, { startDate: projectStartDate });
     }
 
     // Validate and fix project dueDate
     let projectDueDate = project.dueDate;
     const timeline = project.timeline || 30;
-    if (!projectDueDate || new Date(projectDueDate) <= new Date(projectStartDate)) {
-        const calculatedDueDate = new Date(projectStartDate);
+    const startDateObj = new Date(projectStartDate);
+    const originalDueDate = new Date(projectDueDate);
+
+    if (!projectDueDate || originalDueDate <= startDateObj) {
+        const calculatedDueDate = new Date(startDateObj);
         calculatedDueDate.setDate(calculatedDueDate.getDate() + timeline);
         projectDueDate = calculatedDueDate.toISOString().split('T')[0];
-        // Update the project with corrected due date
+        console.log(`🔧 Correcting project due date from ${project.dueDate} to ${projectDueDate}`);
         await Project.findByIdAndUpdate(projectId, { dueDate: projectDueDate });
     }
 
-    // Prepare project data for AI service with validated dates
+    // Prepare project data for AI service with VALIDATED dates
     const projectData = {
         name: project.title || project.name,
         title: project.title || project.name,
         description: project.description,
         timeline: timeline,
-        startDate: projectStartDate,
-        dueDate: projectDueDate,
+        startDate: projectStartDate, // Guaranteed to be today or later
+        dueDate: projectDueDate,     // Guaranteed to be after start date
         priority: project.priority || 'Medium',
         category: project.category || 'General'
     };
+
+    console.log('📅 Using validated project dates:', {
+        startDate: projectData.startDate,
+        dueDate: projectData.dueDate,
+        today: todayStr,
+        startDateValid: projectData.startDate >= todayStr,
+        durationValid: new Date(projectData.dueDate) > new Date(projectData.startDate)
+    });
 
     try {
         let aiResponse;
@@ -296,25 +310,8 @@ const generateSubtasks = asyncHandler(async (req, res) => {
             aiResponse = await aiService.generateProjectTasks(projectData);
             console.log('✅ Successfully used aiService.generateProjectTasks');
         } catch (aiError) {
-            console.log('❌ AIService failed, trying fallback methods:', aiError.message);
-
-            // Method 2: Try alternative method names or chat service extraction
-            try {
-                // Try the chat service's project extraction as fallback
-                const extractedProject = aiService.extractProjectFromConversation([
-                    { sender: 'user', content: project.description }
-                ]);
-
-                if (extractedProject && extractedProject.hasProject) {
-                    aiResponse = await generateBasicTasksFromExtraction(extractedProject, projectData);
-                    console.log('✅ Used chat service extraction as fallback');
-                } else {
-                    throw new Error('Chat service extraction failed');
-                }
-            } catch (fallbackError) {
-                console.log('❌ All AI methods failed:', fallbackError.message);
-                throw new Error('All AI service methods failed');
-            }
+            console.log('❌ AIService failed, using fallback:', aiError.message);
+            throw new Error('AI service failed');
         }
 
         // Validate AI response
@@ -322,18 +319,62 @@ const generateSubtasks = asyncHandler(async (req, res) => {
             throw new Error('Invalid AI response format');
         }
 
-        // Create subtasks with proper date validation
+        // Create subtasks with STRICT date validation
         const subtaskData = aiResponse.subtasks.map((task, index) => {
-            // Validate subtask dates against project dates
-            const subtaskStartDate = task.startDate && new Date(task.startDate) >= new Date(projectStartDate)
-                ? task.startDate
-                : projectStartDate;
+            const projectStart = new Date(projectStartDate);
+            const projectDue = new Date(projectDueDate);
+            const today = new Date();
+            today.setHours(0, 0, 0, 0);
 
-            const subtaskDueDate = task.dueDate &&
-                new Date(task.dueDate) <= new Date(projectDueDate) &&
-                new Date(task.dueDate) >= new Date(subtaskStartDate)
-                ? task.dueDate
-                : projectDueDate;
+            // Parse task dates safely
+            let taskStartDate = null;
+            let taskDueDate = null;
+
+            try {
+                if (task.startDate) {
+                    taskStartDate = new Date(task.startDate);
+                }
+                if (task.dueDate) {
+                    taskDueDate = new Date(task.dueDate);
+                }
+            } catch (error) {
+                console.log(`❌ Invalid date format in task ${index + 1}:`, error.message);
+            }
+
+            // Validate and correct subtask start date
+            let validStartDate = projectStartDate; // Default to project start
+
+            if (taskStartDate &&
+                !isNaN(taskStartDate.getTime()) &&
+                taskStartDate >= today &&
+                taskStartDate >= projectStart &&
+                taskStartDate <= projectDue) {
+                validStartDate = task.startDate;
+            } else {
+                console.log(`🔧 Correcting task ${index + 1} start date to project start: ${projectStartDate}`);
+            }
+
+            // Validate and correct subtask due date
+            let validDueDate = projectDueDate; // Default to project due
+
+            if (taskDueDate &&
+                !isNaN(taskDueDate.getTime()) &&
+                taskDueDate >= new Date(validStartDate) &&
+                taskDueDate <= projectDue) {
+                validDueDate = task.dueDate;
+            } else {
+                // Calculate a proportional due date based on task order
+                const totalTasks = aiResponse.subtasks.length;
+                const taskProgress = (index + 1) / totalTasks;
+                const projectDurationMs = projectDue.getTime() - projectStart.getTime();
+                const taskDueDateMs = projectStart.getTime() + (projectDurationMs * taskProgress);
+                const calculatedDueDate = new Date(taskDueDateMs);
+
+                validDueDate = calculatedDueDate.toISOString().split('T')[0];
+                console.log(`🔧 Calculated proportional due date for task ${index + 1}: ${validDueDate}`);
+            }
+
+            console.log(`📋 Task ${index + 1} final dates: start=${validStartDate}, due=${validDueDate}`);
 
             return {
                 projectId,
@@ -349,11 +390,36 @@ const generateSubtasks = asyncHandler(async (req, res) => {
                 riskLevel: task.riskLevel || 'Low',
                 tags: task.tags || [],
                 skills: task.skills || [],
-                startDate: subtaskStartDate,
-                dueDate: subtaskDueDate,
+                startDate: validStartDate, // GUARANTEED valid date >= today
+                dueDate: validDueDate,     // GUARANTEED valid date within project timeline
                 userId: req.user.id
             };
         });
+
+        const distributeTasksEvenly = (tasks, projectStartDate, projectDueDate) => {
+            const projectStart = new Date(projectStartDate);
+            const projectDue = new Date(projectDueDate);
+            const projectDurationMs = projectDue.getTime() - projectStart.getTime();
+            const taskCount = tasks.length;
+
+            return tasks.map((task, index) => {
+                // Calculate start date (tasks can start at project start or be staggered)
+                const taskStartProgress = index / Math.max(taskCount, 1);
+                const taskStartMs = projectStart.getTime() + (projectDurationMs * taskStartProgress * 0.1); // Small stagger
+                const taskStartDate = new Date(taskStartMs);
+
+                // Calculate due date (evenly distributed across timeline)
+                const taskDueProgress = (index + 1) / taskCount;
+                const taskDueMs = projectStart.getTime() + (projectDurationMs * taskDueProgress);
+                const taskDueDate = new Date(taskDueMs);
+
+                return {
+                    ...task,
+                    startDate: taskStartDate.toISOString().split('T')[0],
+                    dueDate: taskDueDate.toISOString().split('T')[0]
+                };
+            });
+        };
 
         const subtasks = await Subtask.insertMany(subtaskData);
 
@@ -381,11 +447,11 @@ const generateSubtasks = asyncHandler(async (req, res) => {
     } catch (error) {
         console.error('AI subtask generation error:', error);
 
-        // Enhanced fallback subtask generation with proper date handling
+        // Enhanced fallback with guaranteed valid dates
         const fallbackSubtasks = generateFallbackSubtasks({
             ...project.toObject(),
-            startDate: projectStartDate,
-            dueDate: projectDueDate,
+            startDate: projectStartDate, // Use corrected start date
+            dueDate: projectDueDate,     // Use corrected due date
             timeline: timeline
         });
 
@@ -404,7 +470,6 @@ const generateSubtasks = asyncHandler(async (req, res) => {
             }));
 
             const subtasks = await Subtask.insertMany(subtaskData);
-
             await updateProjectProgressAndStatus(projectId);
 
             res.status(201).json({
@@ -425,8 +490,30 @@ const generateSubtasks = asyncHandler(async (req, res) => {
     }
 });
 // ============================================================================
-// ADDITIONAL HELPER METHODS FOR AI INTEGRATION
+// HELPER METHODS FOR AI INTEGRATION
 // ============================================================================
+const validateAndCorrectDates = (projectData) => {
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const todayStr = today.toISOString().split('T')[0];
+
+    // Correct start date if it's in the past
+    if (!projectData.startDate || new Date(projectData.startDate) < today) {
+        projectData.startDate = todayStr;
+        console.log(`🔧 Corrected start date to: ${projectData.startDate}`);
+    }
+
+    // Correct due date if it's before or equal to start date
+    const startDate = new Date(projectData.startDate);
+    if (!projectData.dueDate || new Date(projectData.dueDate) <= startDate) {
+        const correctedDueDate = new Date(startDate);
+        correctedDueDate.setDate(correctedDueDate.getDate() + (projectData.timeline || 30));
+        projectData.dueDate = correctedDueDate.toISOString().split('T')[0];
+        console.log(`🔧 Corrected due date to: ${projectData.dueDate}`);
+    }
+
+    return projectData;
+};
 
 // Update a subtask
 const updateSubtask = async (req, res) => {
